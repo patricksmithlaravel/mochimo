@@ -229,11 +229,11 @@ int b_val(const char *bcfile, const char *ltfile)
    fp = fopen(bcfile, "rb");
    if (fp == NULL) goto ERROR_CLEANUP;
    /* read block trailer (fp left at EOF) */
-   if (fseek(fp, -(sizeof(BTRAILER)), SEEK_END) != 0) return VERROR;
+   if (fseek(fp, -(sizeof(BTRAILER)), SEEK_END) != 0) goto ERROR_CLEANUP;
    if (fread(&bt, sizeof(BTRAILER), 1, fp) != 1) goto RDERR_CLEANUP;
    /* read EOF file offset as file length */
    len = ftell64(fp);
-   if (len == (-1)) return VERROR;
+   if (len == (-1)) goto ERROR_CLEANUP;
 
    /* check for pseudo-block */
    tcount = get32(bt.tcount);
@@ -247,7 +247,7 @@ int b_val(const char *bcfile, const char *ltfile)
       }
    }
    /* read and check regular fixed size block header */
-   if (fseek(fp, 0L, SEEK_SET) != 0) return VERROR;
+   if (fseek(fp, 0L, SEEK_SET) != 0) goto ERROR_CLEANUP;
    if (fread(&bh, sizeof(BHEADER), 1, fp) != 1) goto RDERR_CLEANUP;
 
    /* ... fp is left at beginning of transactions ... */
