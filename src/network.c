@@ -957,7 +957,7 @@ int scan_quorum
 (word32 quorum[], word32 qlen, void *hash, void *weight, void *bnum)
 {
    NODE node;
-   word32 peer;
+   word32 peer, source_peer;
    word32 scanidx = 0;
    word32 qcount = 0;
    word32 netplist[1024];
@@ -993,8 +993,8 @@ int scan_quorum
          num_threads(qlen))
       for (word32 idx = scanidx; idx < netplistidx; idx++) {
          /* get IP list from peer */
-         peer = netplist[idx];
-         if (get_ipl(&node, peer) == VEOK) {
+         source_peer = netplist[idx];
+         if (get_ipl(&node, source_peer) == VEOK) {
             OMP_CRITICAL_()
             {
                /* check peer's chain weight against highweight */
@@ -1021,8 +1021,8 @@ int scan_quorum
                    * not be combined into a single quorum */
                   if (memcmp(node.tx.cblockhash, highhash, HASHLEN) == 0) {
                      if (quorum && qcount < qlen) {
-                        quorum[qcount++] = peer;
-                        pdebug("%s qualified", ntoa(&peer, NULL));
+                        quorum[qcount++] = source_peer;
+                        pdebug("%s qualified", ntoa(&source_peer, NULL));
                      } else if (quorum == NULL) qcount++;
                   }
                }  /* end if higher or same chain */
@@ -1043,8 +1043,8 @@ int scan_quorum
             /* add peer to recent peers on contribution */
             if (contrib) {
                OMP_CRITICAL_()
-               if (addpeer(peer, Rplist, RPLISTLEN, &Rplistidx)) {
-                  pdebug("Added %s to Rplist", ntoa(&peer, ipstr));
+               if (addpeer(source_peer, Rplist, RPLISTLEN, &Rplistidx)) {
+                  pdebug("Added %s to Rplist", ntoa(&source_peer, ipstr));
                }
             }
          }  /* end if get_ipl() */
