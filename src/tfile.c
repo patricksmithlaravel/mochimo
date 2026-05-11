@@ -336,7 +336,8 @@ int read_trailer(BTRAILER *bt, const char *file)
    if (fp == NULL) return VERROR;
    if (fseek64(fp, -(sizeof(BTRAILER)), SEEK_END) != 0) goto ERROR_CLEANUP;
    if (fread(bt, sizeof(BTRAILER), 1, fp) != 1) {
-      if (ferror(fp)) goto ERROR_CLEANUP;
+      if (!ferror(fp)) set_errno(EMCM_EOF);
+      goto ERROR_CLEANUP;
    }
    /* cleanup */
    fclose(fp);
