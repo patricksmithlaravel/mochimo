@@ -30,6 +30,14 @@
 #include <signal.h>
 #include <string.h>
 
+/**
+ * @todo migrate the embedded _WIN32 compatible ftruncate() MACRO to
+ * a common library (e.g. extended-c -> extio.c)
+ */
+#ifdef _WIN32
+   #define ftruncate(fd, len) _chsize_s(fd, len)
+#endif
+
 /* (long running) Proof of Work interrupt handler */
 static word8 POW_interrupt_signal_;
 static void POW_interrupt_(int sig)
@@ -69,16 +77,19 @@ int append_tfile(const BTRAILER *bt, size_t count, const char *tfile)
 {
    FILE *fp;
    size_t write_count;
+   long long pre_pos;
 
    fp = fopen(tfile, "ab");
    if (fp == NULL) return VERROR;
+   pre_pos = ftell64(fp);
    write_count = fwrite(bt, sizeof(BTRAILER), count, fp);
-   fclose(fp);
-
-   if (write_count != count) {
+   if (write_count != count || fflush(fp) != 0) {
+      if (pre_pos >= 0) ftruncate(fileno(fp), pre_pos);
+      fclose(fp);
       return VERROR;
    }
 
+   fclose(fp);
    return VEOK;
 }
 
@@ -483,8 +494,6 @@ ERROR_CLEANUP:
  * @return (int) value representing operation result
  * @retval VERROR on error; check errno for details
  * @retval VEOK on success
- * @todo migrate the embedded _WIN32 compatible ftruncate() MACRO to
- * a common library (e.g. extended-c -> extio.c)
  */
 int trim_tfile(const char* tfile, const word8 highbnum[8])
 {
@@ -509,10 +518,6 @@ int trim_tfile(const char* tfile, const word8 highbnum[8])
       set_errno(EMCM_BNUM);
       goto ERROR_CLEANUP;
    }
-
-#ifdef _WIN32
-   #define ftruncate(fd, len) _chsize_s(fd, len)
-#endif
 
    /* truncate file at current position */
    if (ftruncate(fileno(fp), ftell64(fp)) != 0) goto ERROR_CLEANUP;
