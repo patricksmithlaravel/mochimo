@@ -67,7 +67,7 @@ SUBINCLUDEDIRS := $(addsuffix /$(SOURCEDIR),$(SUBDIRS))
 CUINCLUDEDIRS := $(if $(NVCC),$(CUDADIR)/include)
 
 # linker and compiler flags
-NVCFLAGS := -Xptxas -Werror
+NVCFLAGS := -Xptxas -Werror -MMD -MP
 CFLAGS := -MMD -MP -Wall -Werror -Wextra -Wpedantic -fopenmp -g -rdynamic
 DFLAGS := $(addprefix -D,$(DEFINES) VERSION=$(VERSION))
 IFLAGS := $(addprefix -I,$(SOURCEDIR) $(CUINCLUDEDIRS) $(SUBINCLUDEDIRS))
@@ -77,6 +77,13 @@ lFlags := -Wl,-\( $(addprefix -l,m $(LIBRARY) $(CULIBRARIES) $(SUBLIBRARIES)) -W
 CCFLAGS := $(IFLAGS) $(DFLAGS) $(CFLAGS) $(CCARGS)
 LDFLAGS := $(LFLAGS) $(DFLAGS) $(CFLAGS) $(CCARGS) $(LDARGS) $(lFlags)
 NVCCFLAGS := $(IFLAGS) $(DFLAGS) $(NVCFLAGS) $(NVCCARGS)
+
+# Peach requires exact IEEE-754 single precision floats on the device
+# (denormals are significant); refuse flush-to-zero / fast-math builds
+NVCCNOIEEE := $(filter -ftz=true --ftz=true -use_fast_math \
+	--use_fast_math -prec-div=false --prec-div=false,$(NVCCARGS))
+$(if $(NVCCNOIEEE),$(error NVCCARGS "$(NVCCNOIEEE)" breaks Peach \
+	consensus (IEEE-754 floats required, no -ftz/fast-math/-prec-div)))
 
 ################################################################
 
@@ -168,15 +175,19 @@ TESTNAMES:= $(basename $(patsubst $(TESTBUILDDIR)/%,%,$(TESTOBJECTS)))
 TESTCOMPS:= $(shell echo $(TESTOBJECTS) | sed 's/\s/\n/g' | \
 	sed -E 's/\S*\/([^-]*)[-.]+\S*/\1/g' | sort -u)
 
-# build and run specific tests matching pattern
+# build and run specific tests matching pattern; exits non-zero when any
+# of those tests failed (or failed to build)
 test-%: $(SUBLIBRARYFILES) $(LIBRARYFILE)
 	@echo -e "\n[--------] Performing $(words $(filter $*%,$(TESTNAMES)))" \
 		"tests matching \"$*\""
-	@$(foreach TEST,\
+	@FAILS=0; $(foreach TEST,\
 		$(addprefix $(TESTBUILDDIR)/,$(filter $*%,$(TESTNAMES))),\
-		make $(TEST) -s && ( $(TEST) && echo "[ ✔ PASS ] $(TEST)" || \
-		( touch $(TEST).fail && echo "[ ✖ FAIL ] $(TEST)" ) \
-	 ) || ( touch $(TEST).fail && \ echo "[  ERROR ] $(TEST), ecode=$$?" ); )
+		make $(TEST) -s && { $(TEST) && echo "[ ✔ PASS ] $(TEST)" || \
+		{ touch $(TEST).fail; FAILS=$$((FAILS + 1)); \
+		echo "[ ✖ FAIL ] $(TEST)"; }; } || { ECODE=$$?; \
+		touch $(TEST).fail; FAILS=$$((FAILS + 1)); \
+		echo "[  ERROR ] $(TEST), ecode=$$ECODE"; }; ) \
+	 test $$FAILS -eq 0
 
 # build and run tests
 test: $(SUBLIBRARYFILES) $(LIBRARYFILE) $(TESTOBJECTS)
@@ -326,3 +337,5 @@ $(SUBSOURCEDIRS): %:
 # include depends rules created during "build object file" process
 -include $(patsubst $(SOURCEDIR)/%.c,$(BUILDDIR)/%.d,\
    $(BCSRCS) $(CSRCS) $(TCSRCS) $(TCUSRCS) $(TCLSRCS))
+# ... and by nvcc (-MMD -MP) for *.cu objects
+-include $(patsubst $(SOURCEDIR)/%.cu,$(BUILDDIR)/%.cu.d,$(CUSRCS))
