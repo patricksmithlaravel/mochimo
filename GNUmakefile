@@ -79,11 +79,25 @@ LDFLAGS := $(LFLAGS) $(DFLAGS) $(CFLAGS) $(CCARGS) $(LDARGS) $(lFlags)
 NVCCFLAGS := $(IFLAGS) $(DFLAGS) $(NVCFLAGS) $(NVCCARGS)
 
 # Peach requires exact IEEE-754 single precision floats on the device
-# (denormals are significant); refuse flush-to-zero / fast-math builds
-NVCCNOIEEE := $(filter -ftz=true --ftz=true -use_fast_math \
-	--use_fast_math -prec-div=false --prec-div=false,$(NVCCARGS))
-$(if $(NVCCNOIEEE),$(error NVCCARGS "$(NVCCNOIEEE)" breaks Peach \
-	consensus (IEEE-754 floats required, no -ftz/fast-math/-prec-div)))
+# (denormals are significant), so device code must not be compiled with
+# flush-to-zero or approximate division. Rather than matching option
+# spellings, ask nvcc (--dryrun) which settings it would pass to cicc; this
+# also covers space separated values, NVCC_APPEND_FLAGS/NVCC_PREPEND_FLAGS
+# and options files. Fails closed when nvcc does not report -ftz at all.
+NVCCIEEECHECK = NVCCDRY=$$($(NVCC) --dryrun -c -x cu /dev/null -o /dev/null \
+	$(NVCCFLAGS) 2>&1) || { echo "$$NVCCDRY" >&2; exit 1; }; \
+	NONIEEE=$$(echo "$$NVCCDRY" | grep -o -E -e '-(ftz=1|prec_div=0)\b' | \
+		sort -u | tr '\n' ' '); \
+	if test -n "$$NONIEEE"; then \
+		echo "error: nvcc would compile device code with $$NONIEEE(flush-to-zero" \
+			"or approximate division); Peach requires IEEE-754 floats. Remove" \
+			"-ftz/--use_fast_math/-prec-div from NVCCARGS, NVCC_APPEND_FLAGS" \
+			"and NVCC_PREPEND_FLAGS." >&2; exit 1; \
+	fi; \
+	if ! echo "$$NVCCDRY" | grep -q -E -e '-ftz=0\b'; then \
+		echo "error: could not verify nvcc float settings (no -ftz=0 in" \
+			"nvcc --dryrun output)" >&2; exit 1; \
+	fi
 
 ################################################################
 
@@ -318,6 +332,7 @@ $(BUILDDIR)/%: $(SUBLIBRARYFILES) $(LIBRARYFILE) $(BUILDDIR)/%.o
 # build cuda objects, within build directory, from *.cu files
 $(BUILDDIR)/%.cu.o: $(SOURCEDIR)/%.cu
 	@mkdir -p $(dir $@)
+	@$(NVCCIEEECHECK)
 	$(NVCC) -c $(SOURCEDIR)/$*.cu -o $@ $(NVCCFLAGS)
 
 # build c objects, within build directory, from *.c files
