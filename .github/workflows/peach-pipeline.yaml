@@ -1,0 +1,59 @@
+##
+# peach-pipeline.yaml - Peach CUDA solver checks: CPU tests (device code via
+# CPU emulation), CUDA build and the ptxas resource gate.
+# Copyright 2025 Adequate Systems, LLC. All Rights Reserved.
+#
+
+name: Peach Pipeline
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Peach CPU tests (NO_CUDA)
+        run: >-
+          make -k test-peach-select test-peach-hash test-peach-pipeline
+          test-peach-vectors NO_CUDA=1
+      - name: Fail on any failed test
+        if: always()
+        run: |
+          FAILS=$(find build -name '*.fail' 2>/dev/null)
+          if [ -n "$FAILS" ]; then
+            echo "Failed tests:"
+            echo "$FAILS"
+            exit 1
+          fi
+
+  cuda-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container: nvidia/cuda:12.9.1-devel-ubuntu24.04
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git make
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Trust workspace (git describe in GNUmakefile)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Build (CUDA, default architecture)
+        run: make all
+      - name: ptxas gate (kcu_peach_pipe_* kernels, no stack frame or spills)
+        run: .github/scripts/peach-ptxas-gate.sh 61 75 86 89 90 120

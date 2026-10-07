@@ -5,6 +5,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ***
 
+## [Unreleased]
+
+Draft. Groundwork for a faster CUDA Peach solver (the "pipeline" solver) is in progress. Until it lands, every CUDA device keeps using the official Peach kernel. The changes below make the existing solver safer and prepare its configuration, build checks and tests.
+
+### Planned
+- **Pipeline solver** for CUDA devices. Nonces are processed in batches of N slots: an init kernel, then 8 rounds where each round runs one kernel per Nighthash algorithm over a queue of the nonces whose next jump uses that algorithm, then a final kernel that hashes the last tile and checks the difficulty. Jump algorithms come from a 2 MiB transition table built with the Peach map. This is an exact decomposition of the floating-point algorithm selection, checked bit for bit against the reference. By default it drops nonces whose next jump would use MD2, which costs roughly 10-19x more than the other hashes. Each completed nonce is an independent and fully valid attempt, so dropping some changes throughput only, never the validity of a solve. Safeguards: every solve is verified on the CPU, canary nonces are checked against the CPU reference, a self-test runs after each map build, and any mismatch falls back to the official solver.
+
+### Added
+- `peach_free_cuda_device()` releases a device's Peach context (device and pinned memory, streams, events) so the device can be initialized again, for example with a different configuration. Contexts whose initialization failed partway are released too.
+- Peach CUDA solver configuration through environment variables. `peach_init_cuda_device()` reads them once per device and logs the result in one line per device. An invalid value is ignored with a warning and its default is used.
+  - `MCM_PEACH_LEGACY=1` selects the official solver (default `0`: the pipeline solver, once available).
+  - `MCM_PEACH_SKIP=<mask>` or 8 comma-separated masks (round 0 first) set the per-round skip masks of the pipeline solver. Bit `a` drops nonces whose jump in that round would use algorithm `a`. One mask applies to all rounds. Each mask is `0`..`0xFE` (`0xFF` would drop every nonce). The default is `0x40` (MD2) in every round; `0` evaluates every nonce in full.
+  - `MCM_PEACH_BATCH=<slots>` sets the slots per pipeline batch. The default is automatic: 32 per resident GPU thread, limited by free device memory. Values are clamped to [128 x SMs, memory limit] and rounded to multiples of 128.
+  - Numbers may be decimal or hexadecimal with a `0x` prefix.
+- Shared CUDA/C groundwork for the pipeline solver: `src/peach_compat.cuh`, `src/peach_select.h`, `src/peach_pipeline.cuh`, and the CPU emulation layer `src/test/_cuda_emu.h`, which runs device code in CPU unit tests.
+- Tests: `peach-select` (CPU) checks the decomposed algorithm selection against the reference `peach_dflops()`. `peach-gpuab-cu` (GPU only, for manual runs) compares legacy and pipeline solver throughput in completed nonces per second, verifies every solve with `peach_checkhash()`, and skips cleanly when no CUDA device is present.
+- CI workflow `.github/workflows/peach-pipeline.yaml` runs the Peach CPU tests without CUDA, a CUDA build, and a ptxas gate (`.github/scripts/peach-ptxas-gate.sh`). The gate fails if any `kcu_peach_pipe_*` kernel has a stack frame or register spills on sm_61, sm_75, sm_86, sm_89, sm_90 or sm_120.
+
+### Changed
+- `peach_solve_cuda()` now works on a consistent snapshot of the block trailer, which another thread may update concurrently. Before, a trailer update in the middle of a call could pair a new trailer with the old Peach map for a whole block.
+- `peach_solve_cuda()` now writes a solve to the output trailer only after `peach_checkhash()` confirms it on the CPU at the difficulty it was searched with. A rejected candidate is alerted and counted, and the device keeps working; before, one invalid solve could pause every device for the rest of the block.
+
+### Fixed
+- Build: nvcc dependency tracking (`-MMD -MP`), so header changes rebuild `peach.cu`. `make` also refuses nvcc settings that would compile device code with flush-to-zero or approximate division (for example `--use_fast_math`), because Peach requires exact IEEE-754 single precision, denormals included.
+- Tests: `make test-<name>` now exits non-zero when a matching test fails or fails to build. The removed `BTSIZE` macro in tests was replaced with `sizeof(BTRAILER)`.
+
 ## [3.1.0-beta] - April 18th, 2026
 
 This pre-release consolidates the F-series audit remediations merged into `master` over the past weeks. The audit covered variability-induced failures, data races, error-handling gaps, and locale/platform determinism in consensus-critical and network-handling paths. No protocol or consensus rule changes are included; all changes are behavioral corrections on existing code paths. Operators running mainnet nodes are encouraged to test this release in a non-production environment and report any regressions prior to a stable `3.1.0` tag.
