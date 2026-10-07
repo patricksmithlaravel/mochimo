@@ -38,6 +38,7 @@
  * tables (Z_ING, Z_NS, Z_MASS, Z_PREP, Z_ADJ) and cu_rand64() */
 #include "peach_compat.cuh"
 #include "peach_select.h"
+#define PEACH_PIPE_DEFER_KERNELS  /* kernels: after the official ones */
 #include "peach_pipeline.cuh"
 
 /* Peach CUDA solver modes (PEACH_CUDA_CTX.mode) */
@@ -919,6 +920,12 @@ __global__ void kcu_peach_checkhash
       return;
    }
 }  /* end kcu_peach_checkhash() */
+
+/* Peach pipeline kernels, compiled after the official kernels so that the
+ * official sm_61 __constant__ tables keep their addresses (see
+ * peach_pipeline.cuh) */
+#undef PEACH_PIPE_DEFER_KERNELS
+#include "peach_pipeline.cuh"
 
 /**
  * @private
