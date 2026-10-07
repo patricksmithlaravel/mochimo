@@ -1,0 +1,296 @@
+/**
+ * @file peach-gpuab-cu.c
+ * @brief GPU A/B test of the Peach CUDA solvers: legacy vs pipeline.
+ * @details GPU only; without a usable CUDA device the test is skipped
+ * (exit 0). For each configuration, one CUDA device is initialized with
+ * peach_init_cuda_device() under that configuration's environment
+ * (MCM_PEACH_LEGACY, MCM_PEACH_SKIP), the Peach map is built, and the
+ * solver runs for a fixed time on the same block trailer at a moderate
+ * difficulty. Every reported solve must belong to that trailer and pass
+ * peach_check(). The device is released with peach_free_cuda_device()
+ * between configurations. Reports completed nonces per second (work
+ * counted by the solver over the solving time) and the speedup over the
+ * legacy solver. Time bounded: map build <= 300 s, solving as below.
+ * <br />
+ * Optional environment:
+ * - PEACH_GPUAB_SECONDS: solving time per configuration (default 20,
+ *   at most 180 so the trailer cannot expire while solving)
+ * - PEACH_GPUAB_DIFF: difficulty (default 24)
+ * - PEACH_GPUAB_DEVICE: CUDA device index (default 0)
+ * - PEACH_GPUAB_SWEEP=1: also run pipeline MCM_PEACH_SKIP variants
+ * - PEACH_GPUAB_DEBUG=1: debug logging (e.g. pipeline batch sizing)
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include <cuda_runtime_api.h>
+
+#include "extint.h"
+#include "extlib.h"
+#include "exttime.h"
+
+#include "error.h"
+#include "peach.h"
+#include "device.h"
+
+#define GPUMAX          16
+#define BUILD_TIMEOUT   300.0    /* seconds, map build limit */
+#define DEF_SECONDS     20       /* seconds of solving per configuration */
+#define MAX_SECONDS     180      /* stays below BRIDGEv3 (trailer expiry) */
+#define DEF_DIFF        24       /* difficulty */
+#define MIN_EXPECTED    30.0     /* expected solves for the "any" check */
+
+/* Block 0x1 trailer data taken directly from the Mochimo Blockchain Tfile
+ * (as src/test/peach-mining-cu.c); tcount = 1 */
+static const word8 Block1[sizeof(BTRAILER)] = {
+   0x00, 0x17, 0x0c, 0x67, 0x11, 0xb9, 0xdc, 0x3c, 0xa7, 0x46,
+   0xc4, 0x6c, 0xc2, 0x81, 0xbc, 0x69, 0xe3, 0x03, 0xdf, 0xad,
+   0x2f, 0x33, 0x3b, 0xa3, 0x97, 0xba, 0x06, 0x1e, 0xcc, 0xef,
+   0xde, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+   0xf4, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+   0xf7, 0x2d, 0x1f, 0xae, 0xa8, 0x7f, 0x5b, 0x8f, 0x3c, 0xa9,
+   0xce, 0x6c, 0xdd, 0x5a, 0xe6, 0xf1, 0xb0, 0x81, 0xe5, 0x70,
+   0xc1, 0xf8, 0xe9, 0x63, 0x90, 0xb1, 0x25, 0x38, 0x8e, 0x48,
+   0x46, 0x73, 0x10, 0xf9, 0x01, 0x05, 0xf1, 0x01, 0x26, 0x00,
+   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x56, 0xdf,
+   0x01, 0x11, 0x05, 0x4b, 0xb7, 0x03, 0x01, 0x56, 0x00, 0x00,
+   0x00, 0x00, 0x00, 0x00, 0xb1, 0x0d, 0x31, 0x5b, 0x78, 0x49,
+   0x1f, 0x37, 0xaa, 0xa7, 0x54, 0xef, 0x7d, 0xb8, 0x1a, 0x96,
+   0x42, 0xd4, 0xba, 0x1c, 0xf7, 0x2f, 0x6e, 0x37, 0xff, 0x92,
+   0x99, 0x9a, 0xa0, 0x32, 0x55, 0x51, 0xbc, 0xf1, 0x5f, 0x69
+};
+
+/* solver configurations; the first is the baseline */
+typedef struct {
+   const char *name;    /* label */
+   const char *legacy;  /* MCM_PEACH_LEGACY */
+   const char *skip;    /* MCM_PEACH_SKIP, or NULL (unset: default) */
+   int sweep;           /* run only with PEACH_GPUAB_SWEEP=1 */
+} GPUAB_CONFIG;
+
+static const GPUAB_CONFIG Config[] = {
+   { "legacy", "1", NULL, 0 },
+   { "pipeline", "0", NULL, 0 },
+   { "pipeline skip=0x00", "0", "0", 1 },
+   { "pipeline skip=0x00,0x40x7", "0",
+      "0,0x40,0x40,0x40,0x40,0x40,0x40,0x40", 1 },
+   { "pipeline skip=0x70", "0", "0x70", 1 }
+};
+
+#define NCONFIG   ((int) (sizeof(Config) / sizeof(Config[0])))
+
+/**
+ * Monotonic time, in seconds.
+*/
+static double now_sec(void)
+{
+   struct timespec ts;
+
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (double) ts.tv_sec + (double) ts.tv_nsec * 1e-9;
+}
+
+/**
+ * Read a small non-negative integer from the environment.
+*/
+static long env_long(const char *name, long def, long min, long max)
+{
+   const char *str = getenv(name);
+   char *end;
+   long value;
+
+   if (str == NULL || *str == '\0') return def;
+   value = strtol(str, &end, 10);
+   if (*end != '\0' || value < min || value > max) {
+      printf("ignoring invalid %s=\"%s\" (using %ld)\n", name, str, def);
+      return def;
+   }
+
+   return value;
+}
+
+/**
+ * Run one solver configuration on device @a dev.
+ * @returns completed nonces per second, or a negative value on failure
+*/
+static double run_config(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
+   const BTRAILER *bt_in, double seconds)
+{
+   BTRAILER bt, btout;
+   double t0, tstart, elapsed, build, rate, expect;
+   unsigned long solves;
+   int ecode, ok;
+
+   /* configure (read once by peach_init_cuda_device()) */
+   setenv("MCM_PEACH_LEGACY", cfg->legacy, 1);
+   if (cfg->skip) setenv("MCM_PEACH_SKIP", cfg->skip, 1);
+   else unsetenv("MCM_PEACH_SKIP");
+   unsetenv("MCM_PEACH_BATCH");
+
+   /* fresh trailer: not expired, not solved (btout bnum differs) */
+   memcpy(&bt, bt_in, sizeof(bt));
+   put32(bt.time0, (word32) time(NULL));
+   memset(&btout, 0, sizeof(btout));
+
+   printf("== %s (MCM_PEACH_LEGACY=%s MCM_PEACH_SKIP=%s)\n", cfg->name,
+      cfg->legacy, cfg->skip ? cfg->skip : "<default>");
+   fflush(stdout);
+   if (peach_init_cuda_device(dev) != VEOK) {
+      printf("FAIL: peach_init_cuda_device()\n");
+      peach_free_cuda_device(dev);
+      return -1.0;
+   }
+
+   /* build the Peach map (DEV_INIT -> DEV_IDLE -> DEV_WORK) */
+   ok = 1;
+   t0 = now_sec();
+   while (dev->status != DEV_WORK) {
+      /* keep time0 fresh until solving starts, so a slow map build cannot
+       * expire the trailer (BRIDGEv3) before the IDLE -> WORK gate */
+      put32(bt.time0, (word32) time(NULL));
+      ecode = peach_solve_cuda(dev, &bt, 0, &btout);
+      if (ecode == VETIMEOUT || dev->status < DEV_NULL) {
+         printf("FAIL: device failed during map build (status %d)\n",
+            dev->status);
+         ok = 0;
+         break;
+      }
+      if (ecode == VEOK) {
+         printf("FAIL: solve reported during map build\n");
+         ok = 0;
+         break;
+      }
+      if (now_sec() - t0 > BUILD_TIMEOUT) {
+         printf("FAIL: map build timeout (%.0f s)\n", BUILD_TIMEOUT);
+         ok = 0;
+         break;
+      }
+      millisleep(1);
+   }
+   build = now_sec() - t0;
+
+   /* solve for a fixed time, verify every solve */
+   solves = 0;
+   tstart = now_sec();
+   elapsed = 0.0;
+   while (ok && (elapsed = now_sec() - tstart) < seconds) {
+      ecode = peach_solve_cuda(dev, &bt, 0, &btout);
+      if (ecode == VETIMEOUT || dev->status < DEV_NULL) {
+         printf("FAIL: device failed while solving (status %d)\n",
+            dev->status);
+         ok = 0;
+         break;
+      }
+      if (ecode == VEOK) {
+         if (memcmp(&btout, &bt, 92) != 0) {
+            printf("FAIL: solve for a different block trailer\n");
+            ok = 0;
+            break;
+         }
+         if (peach_check(&btout) != VEOK) {
+            printf("FAIL: invalid solve (peach_check)\n");
+            ok = 0;
+            break;
+         }
+         solves++;
+         /* keep solving: the block counts as "not solved yet" */
+         memset(&btout, 0, sizeof(btout));
+      }
+      if (dev->status != DEV_WORK) {
+         printf("FAIL: device left DEV_WORK (status %d)\n", dev->status);
+         ok = 0;
+         break;
+      }
+      millisleep(1);
+   }
+
+   rate = elapsed > 0.0 ? (double) dev->work / elapsed : 0.0;
+   expect = (double) dev->work / (double) (1ULL << bt.difficulty[0]);
+   if (ok) {
+      printf("   map %.1f s; %.3f M completed nonces/s over %.1f s;"
+         " %lu solves verified (expected ~%.1f)\n", build, rate / 1e6,
+         elapsed, solves, expect);
+      if (solves == 0 && expect >= MIN_EXPECTED) {
+         printf("FAIL: no solves, ~%.0f expected\n", expect);
+         ok = 0;
+      }
+   }
+   fflush(stdout);
+
+   if (peach_free_cuda_device(dev) != VEOK) {
+      printf("FAIL: peach_free_cuda_device()\n");
+      ok = 0;
+   }
+   if (dev->peach != NULL || dev->status != DEV_NULL) {
+      printf("FAIL: device context not released\n");
+      ok = 0;
+   }
+
+   return ok ? rate : -1.0;
+}
+
+int main(void)
+{
+   DEVICE_CTX D[GPUMAX];
+   BTRAILER bt;
+   double rate[NCONFIG], seconds;
+   cudaError_t err;
+   word32 seed;
+   int count, devidx, i, sweep, fails;
+   long diff;
+
+   /* skip without a usable CUDA device (no driver, or no device) */
+   count = 0;
+   err = cudaGetDeviceCount(&count);
+   if (err != cudaSuccess || count < 1) {
+      printf("SKIP: no usable CUDA device (%s); GPU A/B test not run\n",
+         err != cudaSuccess ? cudaGetErrorString(err) : "0 devices");
+      return 0;
+   }
+
+   seconds = (double) env_long("PEACH_GPUAB_SECONDS", DEF_SECONDS, 1,
+      MAX_SECONDS);
+   diff = env_long("PEACH_GPUAB_DIFF", DEF_DIFF, 8, 48);
+   devidx = (int) env_long("PEACH_GPUAB_DEVICE", 0, 0, GPUMAX - 1);
+   sweep = (int) env_long("PEACH_GPUAB_SWEEP", 0, 0, 1);
+   if (env_long("PEACH_GPUAB_DEBUG", 0, 0, 1)) setploglevel(PLOG_DEBUG);
+
+   memset(D, 0, sizeof(D));
+   count = init_cuda_devices(D, GPUMAX);
+   if (count < 1 || devidx >= count) {
+      printf("SKIP: CUDA device %d not available (%d devices)\n",
+         devidx, count);
+      return 0;
+   }
+   printf("GPU A/B: device %d: %s; difficulty %ld; %.0f s per config\n",
+      devidx, D[devidx].info, diff, seconds);
+
+   seed = (word32) time(NULL);
+   srand16(seed, seed ^ 0x5a5a5a5a, seed ^ 0xa5a5a5a5);
+   memcpy(&bt, Block1, sizeof(bt));
+   bt.difficulty[0] = (word8) diff;
+
+   fails = 0;
+   for (i = 0; i < NCONFIG; i++) {
+      rate[i] = 0.0;
+      if (Config[i].sweep && !sweep) continue;
+      rate[i] = run_config(&D[devidx], &Config[i], &bt, seconds);
+      if (rate[i] < 0.0) fails++;
+   }
+
+   printf("== summary (completed nonces/s, speedup vs %s)\n", Config[0].name);
+   for (i = 0; i < NCONFIG; i++) {
+      if (Config[i].sweep && !sweep) continue;
+      if (rate[i] < 0.0) printf("   %-28s FAILED\n", Config[i].name);
+      else {
+         printf("   %-28s %10.3f M/s  x%.2f\n", Config[i].name,
+            rate[i] / 1e6, rate[0] > 0.0 ? rate[i] / rate[0] : 0.0);
+      }
+   }
+
+   return fails ? EXIT_FAILURE : EXIT_SUCCESS;
+}
