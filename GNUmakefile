@@ -67,7 +67,7 @@ SUBINCLUDEDIRS := $(addsuffix /$(SOURCEDIR),$(SUBDIRS))
 CUINCLUDEDIRS := $(if $(NVCC),$(CUDADIR)/include)
 
 # linker and compiler flags
-NVCFLAGS := -Xptxas -Werror
+NVCFLAGS := -Xptxas -Werror -MMD -MP
 CFLAGS := -MMD -MP -Wall -Werror -Wextra -Wpedantic -fopenmp -g -rdynamic
 DFLAGS := $(addprefix -D,$(DEFINES) VERSION=$(VERSION))
 IFLAGS := $(addprefix -I,$(SOURCEDIR) $(CUINCLUDEDIRS) $(SUBINCLUDEDIRS))
@@ -77,6 +77,27 @@ lFlags := -Wl,-\( $(addprefix -l,m $(LIBRARY) $(CULIBRARIES) $(SUBLIBRARIES)) -W
 CCFLAGS := $(IFLAGS) $(DFLAGS) $(CFLAGS) $(CCARGS)
 LDFLAGS := $(LFLAGS) $(DFLAGS) $(CFLAGS) $(CCARGS) $(LDARGS) $(lFlags)
 NVCCFLAGS := $(IFLAGS) $(DFLAGS) $(NVCFLAGS) $(NVCCARGS)
+
+# Peach requires exact IEEE-754 single precision floats on the device
+# (denormals are significant), so device code must not be compiled with
+# flush-to-zero or approximate division. Rather than matching option
+# spellings, ask nvcc (--dryrun) which settings it would pass to cicc; this
+# also covers space separated values, NVCC_APPEND_FLAGS/NVCC_PREPEND_FLAGS
+# and options files. Fails closed when nvcc does not report -ftz at all.
+NVCCIEEECHECK = NVCCDRY=$$($(NVCC) --dryrun -c -x cu /dev/null -o /dev/null \
+	$(NVCCFLAGS) 2>&1) || { echo "$$NVCCDRY" >&2; exit 1; }; \
+	NONIEEE=$$(echo "$$NVCCDRY" | grep -o -E -e '-(ftz=1|prec_div=0)\b' | \
+		sort -u | tr '\n' ' '); \
+	if test -n "$$NONIEEE"; then \
+		echo "error: nvcc would compile device code with $$NONIEEE(flush-to-zero" \
+			"or approximate division); Peach requires IEEE-754 floats. Remove" \
+			"-ftz/--use_fast_math/-prec-div from NVCCARGS, NVCC_APPEND_FLAGS" \
+			"and NVCC_PREPEND_FLAGS." >&2; exit 1; \
+	fi; \
+	if ! echo "$$NVCCDRY" | grep -q -E -e '-ftz=0\b'; then \
+		echo "error: could not verify nvcc float settings (no -ftz=0 in" \
+			"nvcc --dryrun output)" >&2; exit 1; \
+	fi
 
 ################################################################
 
@@ -168,15 +189,19 @@ TESTNAMES:= $(basename $(patsubst $(TESTBUILDDIR)/%,%,$(TESTOBJECTS)))
 TESTCOMPS:= $(shell echo $(TESTOBJECTS) | sed 's/\s/\n/g' | \
 	sed -E 's/\S*\/([^-]*)[-.]+\S*/\1/g' | sort -u)
 
-# build and run specific tests matching pattern
+# build and run specific tests matching pattern; exits non-zero when any
+# of those tests failed (or failed to build)
 test-%: $(SUBLIBRARYFILES) $(LIBRARYFILE)
 	@echo -e "\n[--------] Performing $(words $(filter $*%,$(TESTNAMES)))" \
 		"tests matching \"$*\""
-	@$(foreach TEST,\
+	@FAILS=0; $(foreach TEST,\
 		$(addprefix $(TESTBUILDDIR)/,$(filter $*%,$(TESTNAMES))),\
-		make $(TEST) -s && ( $(TEST) && echo "[ ✔ PASS ] $(TEST)" || \
-		( touch $(TEST).fail && echo "[ ✖ FAIL ] $(TEST)" ) \
-	 ) || ( touch $(TEST).fail && \ echo "[  ERROR ] $(TEST), ecode=$$?" ); )
+		make $(TEST) -s && { $(TEST) && echo "[ ✔ PASS ] $(TEST)" || \
+		{ touch $(TEST).fail; FAILS=$$((FAILS + 1)); \
+		echo "[ ✖ FAIL ] $(TEST)"; }; } || { ECODE=$$?; \
+		touch $(TEST).fail; FAILS=$$((FAILS + 1)); \
+		echo "[  ERROR ] $(TEST), ecode=$$ECODE"; }; ) \
+	 test $$FAILS -eq 0
 
 # build and run tests
 test: $(SUBLIBRARYFILES) $(LIBRARYFILE) $(TESTOBJECTS)
@@ -307,6 +332,7 @@ $(BUILDDIR)/%: $(SUBLIBRARYFILES) $(LIBRARYFILE) $(BUILDDIR)/%.o
 # build cuda objects, within build directory, from *.cu files
 $(BUILDDIR)/%.cu.o: $(SOURCEDIR)/%.cu
 	@mkdir -p $(dir $@)
+	@$(NVCCIEEECHECK)
 	$(NVCC) -c $(SOURCEDIR)/$*.cu -o $@ $(NVCCFLAGS)
 
 # build c objects, within build directory, from *.c files
@@ -326,3 +352,5 @@ $(SUBSOURCEDIRS): %:
 # include depends rules created during "build object file" process
 -include $(patsubst $(SOURCEDIR)/%.c,$(BUILDDIR)/%.d,\
    $(BCSRCS) $(CSRCS) $(TCSRCS) $(TCUSRCS) $(TCLSRCS))
+# ... and by nvcc (-MMD -MP) for *.cu objects
+-include $(patsubst $(SOURCEDIR)/%.cu,$(BUILDDIR)/%.cu.d,$(CUSRCS))
