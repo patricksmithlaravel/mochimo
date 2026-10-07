@@ -32,12 +32,11 @@
 #include "sha256.cu"
 #include "sha3.h"
 
-/* sm_61 performs MUCH better with the __constant__ qualifier */
-#if __CUDA_ARCH__ == 610
-   #define cuCONSTn860 __constant__
-#else
-   #define cuCONSTn860
-#endif
+/* Peach pipeline support -- also provides cuCONSTn860, the nonce frame
+ * tables (Z_ING, Z_NS, Z_MASS, Z_PREP, Z_ADJ) and cu_rand64() */
+#include "peach_compat.cuh"
+#include "peach_select.h"
+#include "peach_pipeline.cuh"
 
 /**
  * @private
@@ -52,33 +51,6 @@ typedef struct {
    word64 *d_map;                      /**< Peach Map */
    word32 *d_phash;                    /**< previous hash */
 } PEACH_CUDA_CTX;
-
-__device__ cuCONSTn860 static word64 Z_ING[32] = {
-   18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
-   34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 23, 24, 31, 32, 33, 34
-};
-__device__ cuCONSTn860 static word64 Z_NS[64] = {
-   129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 145, 149, 154,
-   155, 156, 157, 177, 178, 179, 180, 182, 183, 184, 185, 186, 187,
-   188, 189, 190, 191, 192, 193, 194, 196, 197, 198, 199, 200, 201,
-   202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 241,
-   244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255
-};
-__device__ cuCONSTn860 static word64 Z_MASS[32] = {
-   214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224,
-   225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235,
-   236, 237, 238, 239, 240, 242, 214, 215, 216, 219
-};
-__device__ cuCONSTn860 static word64 Z_PREP[8] = {
-   12, 13, 14, 15, 16, 17, 12, 13
-};
-__device__ cuCONSTn860 static word64 Z_ADJ[64] = {
-   61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
-   76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-   91, 92, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104,
-   105, 107, 108, 109, 110, 112, 114, 115, 116, 117, 118,
-   119, 120, 121, 122, 123, 124, 125, 126, 127, 128
-};
 
 /**
  * @private
@@ -759,21 +731,6 @@ __global__ void kcu_srand64(word64 *d_state, word64 seed)
    word64 index = (blockDim.x * blockIdx.x) + threadIdx.x;
    d_state[index] = (seed ^ (index * WORD64_C(0x9e3779b97f4a7c15))) * WORD64_C(0xc6bc279692b5c323);
 }  /* end kcu_srand64() */
-
-/**
- * CUDA device function to generate a 64-bit random number.
- * State generation based on SplitMix64 by Sebastiano Vigna.
- * @param d_state Pointer to location of state
- * @return (word64) value representing a 64-bit random number
- */
-__device__ __forceinline__ word64 cu_rand64(word64 *d_state)
-{
-   word64 index = (blockIdx.x * blockDim.x) + threadIdx.x;
-   word64 z = (d_state[index] += WORD64_C(0x9e3779b97f4a7c15));
-	z = (z ^ (z >> 30)) * WORD64_C(0xbf58476d1ce4e5b9);
-	z = (z ^ (z >> 27)) * WORD64_C(0x94d049bb133111eb);
-	return (d_state[index] = z ^ (z >> 31));
-}  /* end cu_rand64() */
 
 /**
  * CUDA kernel for solving a tokenized haiku as nonce output for Peach proof
