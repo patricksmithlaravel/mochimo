@@ -17,6 +17,9 @@
  * (3) the S-box is read through the pointer argument (a copy gives the
  *     same digest, swapping any two adjacent entries changes it), words
  *     4..7 are zeroed and nothing past out[7] is written.
+ * Checks (1) and (2) also run peach_sh_md2_pre() from the state after
+ * block 0 (crypto-c MD2 of nonce words 0..3), which must give the same
+ * digest.
 */
 
 #include <stdio.h>
@@ -80,6 +83,22 @@ static void ref_md2(const word8 *seed, word32 *out)
    memset(out, 0xA5, 32);
    md2(seed, PEACHJUMPLEN, out);
    out[4] = out[5] = out[6] = out[7] = 0;
+}
+
+/* state bytes 0..15 and checksum after MD2 block 0 = n[0..3] (crypto-c),
+ * as little-endian words: the pre argument of peach_sh_md2_pre() */
+static void md2_first(const word32 *n, word32 *pre)
+{
+   MD2_CTX ctx;
+   int i;
+
+   md2_init(&ctx);
+   md2_update(&ctx, n, 16);
+   for (i = 0; i < 16; i++) {
+      if ((i & 3) == 0) pre[i >> 2] = pre[4 + (i >> 2)] = 0;
+      pre[i >> 2] |= (word32) ctx.state[i] << (8 * (i & 3));
+      pre[4 + (i >> 2)] |= (word32) ctx.checksum[i] << (8 * (i & 3));
+   }
 }
 
 /* tile of a kind: 0 all 0x00, 1 all 0xFF, 2 uniform random,
@@ -172,7 +191,7 @@ static void check_edges(void)
    };
    static const word32 real[3] = { 0, 1, PEACHCACHELEN_M1 };
    uint4 tile[TILE4];
-   word32 n[8], out[8], ref[8];
+   word32 n[8], out[8], ref[8], pre[8];
    word8 seed[PEACHJUMPLEN], phash[32];
    int tk, nk, ik, i, cases = 0;
 
@@ -200,20 +219,24 @@ static void check_edges(void)
             memset(out, 0xA5, sizeof(out));
             peach_sh_md2(n, idx[ik], tile, c_peach_md2_sbox, out);
             ASSERT_CMP(out, ref, 32);
+            md2_first(n, pre);
+            memset(out, 0xA5, sizeof(out));
+            peach_sh_md2_pre(pre, n, idx[ik], tile, c_peach_md2_sbox, out);
+            ASSERT_CMP(out, ref, 32);
             cases++;
          }
       }
    }
    printf("(1) edge cases: tiles {0x00, 0xFF, real 0/1/0xFFFFF x 2 phash} "
-      "x 4 nonces x index {0,1,0xFFFFF,0xFFFFFFFF}: %d cases match\n",
-      cases);
+      "x 4 nonces x index {0,1,0xFFFFF,0xFFFFFFFF}: %d cases match "
+      "(peach_sh_md2() and peach_sh_md2_pre())\n", cases);
 }
 
 /* (2) random cases through an emulated kernel */
 static void check_random(void)
 {
    uint4 *map;
-   word32 *nonce, *index, *out, ref[8], nh[8], next;
+   word32 *nonce, *index, *out, ref[8], nh[8], next, pre[8], outp[8];
    word8 seed[PEACHJUMPLEN], phash[32];
    word64 natural = 0, real = 0, low = 0, edge = 0;
    double t0 = now_s(), t1;
@@ -254,6 +277,12 @@ static void check_random(void)
       make_seed(seed, &nonce[k * 8], index[k], &map[k * TILE4]);
       ref_md2(seed, ref);
       ASSERT_CMP(&out[k * 8], ref, 32);
+      /* the same from the state after block 0 */
+      md2_first(&nonce[k * 8], pre);
+      memset(outp, 0xA5, sizeof(outp));
+      peach_sh_md2_pre(pre, &nonce[k * 8], index[k], &map[k * TILE4],
+         c_peach_md2_sbox, outp);
+      ASSERT_CMP(outp, ref, 32);
       /* reference algorithm selection of this seed picks MD2: the
        * consensus nighthash and jump agree with the seed view */
       if ((peach_dflops(seed, PEACHJUMPLEN, index[k], 0) & 7) == 6) {
@@ -268,7 +297,8 @@ static void check_random(void)
       }
    }
    printf("(2) random cases: %d (%llu real tiles, %llu low entropy tiles, "
-      "%llu edge indices) match crypto-c md2(); %llu select MD2 in the "
+      "%llu edge indices) match crypto-c md2() (also from the state "
+      "after block 0); %llu select MD2 in the "
       "reference and match peach_nighthash() + peach_jump(); seed view "
       "%.2fs, reference %.2fs\n", NRANDOM, (unsigned long long) real,
       (unsigned long long) low, (unsigned long long) edge,

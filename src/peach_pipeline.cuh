@@ -181,6 +181,16 @@ typedef struct {
 } PEACH_PIPE_PARAMS;
 
 /**
+ * MD2 state after block 0 of a jump seed (nonce words 0..3, the same for
+ * every slot of a batch): argument of the MD2 hash kernel, computed on
+ * the host for each launch (peach_pipe_md2_first()).
+*/
+typedef struct {
+   word32 w[8];         /**< state bytes 0..15 (words 0..3) and checksum
+                           bytes 0..15 (words 4..7), little-endian */
+} PEACH_PIPE_MD2PRE;
+
+/**
  * Per-batch result (device memory, copied back by the host).
 */
 typedef struct {
@@ -254,6 +264,8 @@ typedef char peach_pipe_trace_size_check[
    sizeof(PEACH_PIPE_TRACE) == 80 ? 1 : -1];
 typedef char peach_pipe_params_size_check[
    sizeof(PEACH_PIPE_PARAMS) == 104 ? 1 : -1];
+typedef char peach_pipe_md2pre_size_check[
+   sizeof(PEACH_PIPE_MD2PRE) == 32 ? 1 : -1];
 typedef char peach_pipe_result_size_check[
    sizeof(PEACH_PIPE_RESULT) == 136 ? 1 : -1];
 typedef char peach_pipe_bucket_check[(PEACH_PIPE_SORT_SHIFT >= 4 &&
@@ -341,6 +353,7 @@ PEACH_HD word64 peach_pipe_skip_pack(const word8 masks[8])
 #include "peach_hash32.cuh"   /* for SHA-1/SHA-256/MD5, trailer, final */
 #include "peach_hash64.cuh"   /* for Blake2b, SHA3, Keccak */
 #include "peach_hashmd2.cuh"  /* for MD2, c_peach_md2_sbox */
+#include "md2.h"              /* for crypto-c md2 (host, block 0) */
 
 /* loop to unroll fully on the device (constant trip count) */
 #ifdef __CUDA_ARCH__
@@ -634,10 +647,12 @@ PEACH_HD word32 peach_pipe_canary(word32 epoch, word32 n)
  * @param m Tile index
  * @param tile Tile @a m (64 x uint4)
  * @param sbox MD2 S-box (algo 6 only; may be NULL otherwise)
+ * @param md2pre MD2 state after block 0 = n[0..3] (algo 6 only, see
+ * peach_sh_md2_pre(); may be NULL otherwise)
  * @param out Digest as 8 little-endian words, as peach_nighthash()
 */
 PEACH_DEV void peach_pipe_hash(word32 algo, const word32 *n, word32 m,
-   const uint4 *tile, const word8 *sbox, word32 *out)
+   const uint4 *tile, const word8 *sbox, const word32 *md2pre, word32 *out)
 {
    switch (algo) {
       case 0: peach_sh_blake2b32(n, m, tile, out); break;
@@ -646,7 +661,7 @@ PEACH_DEV void peach_pipe_hash(word32 algo, const word32 *n, word32 m,
       case 3: peach_sh_sha256(n, m, tile, out); break;
       case 4: peach_sh_sha3(n, m, tile, out); break;
       case 5: peach_sh_keccak(n, m, tile, out); break;
-      case 6: peach_sh_md2(n, m, tile, sbox, out); break;
+      case 6: peach_sh_md2_pre(md2pre, n, m, tile, sbox, out); break;
       default: peach_sh_md5(n, m, tile, out); break;
    }
 }  /* end peach_pipe_hash() */
@@ -667,9 +682,10 @@ PEACH_DEV void peach_pipe_hash(word32 algo, const word32 *n, word32 m,
  * @param round Round number, 0..7
  * @param algo Algorithm of this kernel, 0..7 (constant)
  * @param sbox MD2 S-box (algo 6 only)
+ * @param md2pre MD2 state after block 0 = p.nonce_lo (algo 6 only)
 */
 PEACH_DEV void peach_pipe_round(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b,
-   int round, word32 algo, const word8 *sbox)
+   int round, word32 algo, const word8 *sbox, const word32 *md2pre)
 {
    const word32 r = (word32) round & 7;
    const int last = (r == PEACHROUNDS - 1);
@@ -709,7 +725,7 @@ PEACH_DEV void peach_pipe_round(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b,
          slot = w.w;
          /* jump: next tile = sum of the digest words */
          peach_pipe_hash(algo, n8, m,
-            &b.d_map[(size_t) m * PEACH_PIPE_TILEVEC], sbox, dh);
+            &b.d_map[(size_t) m * PEACH_PIPE_TILEVEC], sbox, md2pre, dh);
          m = (dh[0] + dh[1] + dh[2] + dh[3] + dh[4] + dh[5] + dh[6] +
             dh[7]) & PEACHCACHELEN_M1;
          if (last) keep = 1;
@@ -872,7 +888,7 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
    PEACH_KERNEL void BOUNDS \
       NAME(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b, int round) \
    { \
-      peach_pipe_round(p, b, round, (ALGO), NULL); \
+      peach_pipe_round(p, b, round, (ALGO), NULL, NULL); \
    }
 
 /* launch bounds of the hash kernels. SHA3/Keccak are close to 128
@@ -939,10 +955,11 @@ PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_md5, 7, PEACH_PIPE_LB_DEFAULT)
  * @param p Batch parameters
  * @param b Batch buffers
  * @param round Round number, 0..7
+ * @param pre MD2 state after block 0 = p.nonce_lo (peach_pipe_md2_first())
 */
 PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK, 5)
    kcu_peach_pipe_hash_md2(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b,
-   int round)
+   int round, PEACH_PIPE_MD2PRE pre)
 {
    const word8 *sbox;
 
@@ -959,7 +976,7 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK, 5)
    sbox = c_peach_md2_sbox;
 #endif
 
-   peach_pipe_round(p, b, round, 6, sbox);
+   peach_pipe_round(p, b, round, 6, sbox, pre.w);
 }  /* end kcu_peach_pipe_hash_md2() */
 
 /**
@@ -1179,6 +1196,34 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
 
 /**
  * @private
+ * MD2 state after block 0 of the jump seeds of a batch: block 0 is nonce
+ * words 0..3 (p->nonce_lo), the same for every slot, so the host runs it
+ * once (crypto-c md2) instead of every MD2 jump of the batch.
+ * @param nlo Nonce words 0..3
+ * @param pre Output: state bytes 0..15 and checksum after block 0
+*/
+PEACH_HOST void peach_pipe_md2_first(const word32 *nlo,
+   PEACH_PIPE_MD2PRE *pre)
+{
+   MD2_CTX ctx;
+   int i;
+
+   md2_init(&ctx);
+   md2_update(&ctx, nlo, 16);
+   for (i = 0; i < 4; i++) {
+      pre->w[i] = (word32) ctx.state[4 * i] |
+         ((word32) ctx.state[(4 * i) + 1] << 8) |
+         ((word32) ctx.state[(4 * i) + 2] << 16) |
+         ((word32) ctx.state[(4 * i) + 3] << 24);
+      pre->w[4 + i] = (word32) ctx.checksum[4 * i] |
+         ((word32) ctx.checksum[(4 * i) + 1] << 8) |
+         ((word32) ctx.checksum[(4 * i) + 2] << 16) |
+         ((word32) ctx.checksum[(4 * i) + 3] << 24);
+   }
+}  /* end peach_pipe_md2_first() */
+
+/**
+ * @private
  * Launch the hash kernel of algorithm @a algo for round @a round.
  * @note Internal to peach_pipe_enqueue(), which validates the launch
  * shape: the kernels' full-warp collectives require a block that is a
@@ -1188,6 +1233,8 @@ PEACH_HOST void peach_pipe_launch_hash(int algo, int grid, int block,
    cudaStream_t s, const PEACH_PIPE_PARAMS *p, const PEACH_PIPE_BUFS *b,
    int round)
 {
+   PEACH_PIPE_MD2PRE pre;
+
    switch (algo) {
       case 0:
          CUDA_KERNEL(kcu_peach_pipe_hash_blake2b32, grid, block, 0, s)
@@ -1214,8 +1261,9 @@ PEACH_HOST void peach_pipe_launch_hash(int algo, int grid, int block,
             (*p, *b, round);
          break;
       case 6:
+         peach_pipe_md2_first(p->nonce_lo, &pre);
          CUDA_KERNEL(kcu_peach_pipe_hash_md2, grid, block, 0, s)
-            (*p, *b, round);
+            (*p, *b, round, pre);
          break;
       default:
          CUDA_KERNEL(kcu_peach_pipe_hash_md5, grid, block, 0, s)

@@ -9,10 +9,17 @@
  * tile as 64 aligned 16-byte loads (each tile byte is loaded once). Block
  * 66 holds the last 4 seed bytes and 12 padding bytes of value 12 (MD2
  * pads 1060 bytes to 1072), block 67 is the checksum: 68 transforms.
+ * Block 0 depends on nonce words 0..3 only, which every slot of a
+ * pipeline batch shares: peach_sh_md2_pre() starts from the state and
+ * checksum after block 0, computed once per batch on the host
+ * (peach_pipe_md2_first() in peach_pipeline.cuh), 67 transforms.
  * <br />
  * The 48-byte state and the 16-byte checksum are held one byte per
  * register; each of the 18 rounds of a transform (48 steps) is fully
  * unrolled with literal register indices, the round loop itself is not.
+ * Only state bytes 0..15 outlive a transform (the next block sets bytes
+ * 16..47, the digest is bytes 0..15), so the last round stops after its
+ * first 16 steps: 832 instead of 864 S-box steps per transform.
  * <br />
  * S-box lookups are data dependent and go through a caller supplied
  * pointer: device callers stage c_peach_md2_sbox into a 256-byte
@@ -109,7 +116,11 @@ static PEACH_CONST word8 c_peach_md2_sbox[256] = {
 
 /**
  * @private
- * The 18 MD2 rounds over the 48 state byte registers.
+ * The 18 MD2 rounds over the 48 state byte registers, as far as they
+ * reach state bytes 0..15: the last round stops after its first 16
+ * steps, since bytes 16..47 and t are dead after a transform (the next
+ * block sets x[16..47]; the digest is x[0..15]). x[16..47] are left
+ * stale.
  * @param x State, 48 byte registers (x[16..47] set by the caller)
  * @param sbox MD2 S-box (see peach_sh_md2())
 */
@@ -121,12 +132,14 @@ PEACH_DEV void peach_md2_rounds(word32 *x, const word8 *sbox)
 #ifdef __CUDA_ARCH__
    #pragma unroll 1
 #endif
-   for (j = 0; j < 18; j++) {
+   for (j = 0; j < 17; j++) {
       PEACH_MD2_STEP16(x, 0, t, sbox);
       PEACH_MD2_STEP16(x, 16, t, sbox);
       PEACH_MD2_STEP16(x, 32, t, sbox);
       t = (t + j) & 0xFF;
    }
+   /* round 17: steps 0..15 only */
+   PEACH_MD2_STEP16(x, 0, t, sbox);
 }  /* end peach_md2_rounds() */
 
 /**
@@ -170,32 +183,27 @@ PEACH_DEV void peach_md2_last(word32 *x, const word32 *c, const word8 *sbox)
 }  /* end peach_md2_last() */
 
 /**
- * MD2 of a Peach jump seed (Nighthash algorithm 6), seed view.
- * @param n Nonce, 8 words (seed words 0..7)
+ * @private
+ * MD2 of a Peach jump seed from the state after block 0 (nonce words
+ * 0..3): blocks 1..67.
+ * @param x State, 48 byte registers: x[0..15] after block 0
+ * @param c Checksum, 16 byte registers, after block 0
+ * @param n Nonce, 8 words (words 4..7 are read)
  * @param m Tile index (seed word 8)
- * @param tile Tile @a m as 64 x 16 bytes, 16-byte aligned (seed words
- * 9..264), read with 64 aligned 128-bit loads
- * @param sbox MD2 S-box: a `__shared__` copy of c_peach_md2_sbox on the
- * device, c_peach_md2_sbox itself in CPU emulation
- * @param out Digest as 8 little-endian words (as peach_nighthash()
- * writes it): MD2 in words 0..3, words 4..7 zero
+ * @param tile Tile @a m as 64 x 16 bytes, 16-byte aligned
+ * @param sbox MD2 S-box (see peach_sh_md2())
+ * @param out Digest as 8 little-endian words (see peach_sh_md2())
 */
-PEACH_DEV void peach_sh_md2(const word32 *n, word32 m, const uint4 *tile,
-   const word8 *sbox, word32 *out)
+PEACH_DEV void peach_md2_seed_from1(word32 *x, word32 *c, const word32 *n,
+   word32 m, const uint4 *tile, const word8 *sbox, word32 *out)
 {
-   word32 x[48], c[16], carry, w0, w1, w2, w3;
+   word32 carry, w0, w1, w2, w3;
    uint4 v;
    int i;
 
-   /* zero state bytes 0..15 and checksum (x[16..47] set per block) */
-   x[0] = x[1] = x[2] = x[3] = x[4] = x[5] = x[6] = x[7] = 0;
-   x[8] = x[9] = x[10] = x[11] = x[12] = x[13] = x[14] = x[15] = 0;
-   c[0] = c[1] = c[2] = c[3] = c[4] = c[5] = c[6] = c[7] = 0;
-   c[8] = c[9] = c[10] = c[11] = c[12] = c[13] = c[14] = c[15] = 0;
-   /* first tile load, latency hidden behind the 2 nonce blocks */
+   /* first tile load, latency hidden behind the nonce block */
    v = PEACH_LDGTILE(&tile[0]);
-   /* blocks 0, 1: nonce */
-   peach_md2_block(x, c, n[0], n[1], n[2], n[3], sbox);
+   /* block 1: nonce words 4..7 */
    peach_md2_block(x, c, n[4], n[5], n[6], n[7], sbox);
    /* blocks 2..65: carried word (m, then t[i - 1].w) || t[i].xyz;
     * the load of t[i + 1] overlaps the transform of block i + 2 */
@@ -220,7 +228,69 @@ PEACH_DEV void peach_sh_md2(const word32 *n, word32 m, const uint4 *tile,
    out[2] = PEACH_MD2_LE32(x, 8);
    out[3] = PEACH_MD2_LE32(x, 12);
    out[4] = out[5] = out[6] = out[7] = 0;
+}  /* end peach_md2_seed_from1() */
+
+/**
+ * MD2 of a Peach jump seed (Nighthash algorithm 6), seed view.
+ * @param n Nonce, 8 words (seed words 0..7)
+ * @param m Tile index (seed word 8)
+ * @param tile Tile @a m as 64 x 16 bytes, 16-byte aligned (seed words
+ * 9..264), read with 64 aligned 128-bit loads
+ * @param sbox MD2 S-box: a `__shared__` copy of c_peach_md2_sbox on the
+ * device, c_peach_md2_sbox itself in CPU emulation
+ * @param out Digest as 8 little-endian words (as peach_nighthash()
+ * writes it): MD2 in words 0..3, words 4..7 zero
+*/
+PEACH_DEV void peach_sh_md2(const word32 *n, word32 m, const uint4 *tile,
+   const word8 *sbox, word32 *out)
+{
+   word32 x[48], c[16];
+
+   /* zero state bytes 0..15 and checksum (x[16..47] set per block) */
+   x[0] = x[1] = x[2] = x[3] = x[4] = x[5] = x[6] = x[7] = 0;
+   x[8] = x[9] = x[10] = x[11] = x[12] = x[13] = x[14] = x[15] = 0;
+   c[0] = c[1] = c[2] = c[3] = c[4] = c[5] = c[6] = c[7] = 0;
+   c[8] = c[9] = c[10] = c[11] = c[12] = c[13] = c[14] = c[15] = 0;
+   /* block 0: nonce words 0..3 */
+   peach_md2_block(x, c, n[0], n[1], n[2], n[3], sbox);
+   peach_md2_seed_from1(x, c, n, m, tile, sbox, out);
 }  /* end peach_sh_md2() */
+
+/**
+ * MD2 of a Peach jump seed (Nighthash algorithm 6), seed view, from the
+ * state after block 0: same digest as peach_sh_md2() when @a pre holds
+ * the state bytes 0..15 and the checksum after block 0 = nonce words
+ * 0..3 (as MD2 of these 16 bytes leaves them; peach_pipe_md2_first()).
+ * @param pre State bytes 0..15 (words 0..3) and checksum bytes 0..15
+ * (words 4..7) after block 0, as little-endian words
+ * @param n Nonce, 8 words (words 4..7 are read; words 0..3 are those
+ * @a pre was computed from)
+ * @param m Tile index (seed word 8)
+ * @param tile Tile @a m (see peach_sh_md2())
+ * @param sbox MD2 S-box (see peach_sh_md2())
+ * @param out Digest (see peach_sh_md2())
+*/
+PEACH_DEV void peach_sh_md2_pre(const word32 *pre, const word32 *n,
+   word32 m, const uint4 *tile, const word8 *sbox, word32 *out)
+{
+   word32 x[48], c[16];
+   int i;
+
+#ifdef __CUDA_ARCH__
+   #pragma unroll
+#endif
+   for (i = 0; i < 4; i++) {
+      x[4 * i] = pre[i] & 0xFF;
+      x[(4 * i) + 1] = (pre[i] >> 8) & 0xFF;
+      x[(4 * i) + 2] = (pre[i] >> 16) & 0xFF;
+      x[(4 * i) + 3] = pre[i] >> 24;
+      c[4 * i] = pre[4 + i] & 0xFF;
+      c[(4 * i) + 1] = (pre[4 + i] >> 8) & 0xFF;
+      c[(4 * i) + 2] = (pre[4 + i] >> 16) & 0xFF;
+      c[(4 * i) + 3] = pre[4 + i] >> 24;
+   }
+   peach_md2_seed_from1(x, c, n, m, tile, sbox, out);
+}  /* end peach_sh_md2_pre() */
 
 /* helper macros are local to this header */
 #undef PEACH_MD2_STEP
