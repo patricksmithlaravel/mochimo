@@ -881,13 +881,16 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
  * CUDA 12.8 and 12.9; the ptxas gate checks the version CI uses):
  * - sm_120: 4 blocks per SM with CUDA 12.8 (122 registers; on an RTX
  *   5090 about 3% faster with the default skip masks than 3 blocks);
- *   with CUDA 12.9 a 4-block bound, or none, spills, so 3 blocks (162
- *   registers);
- * - sm_100 and sm_101: 3 blocks per SM with CUDA 12.8 (168 registers);
- *   with CUDA 12.9 that bound spills, so none (138 registers, also 3
+ *   with CUDA 12.9 a 4-block bound, or none, spilled, so 3 blocks (162
+ *   registers); a 5-block bound fits too with CUDA 12.8 (96 registers),
+ *   but not on sm_86, sm_89, sm_90 or for compute_52 PTX;
+ * - sm_100 and sm_101: 3 blocks per SM with CUDA 12.8 (162 registers);
+ *   with CUDA 12.9 that bound spilled, so none (138 registers, also 3
  *   blocks per SM);
- * - older targets: 4 blocks per SM (115-122 registers with or without
+ * - older targets: 4 blocks per SM (108-115 registers with or without
  *   it), as a guard.
+ * The CUDA 12.9 figures predate the 32-bit-half Keccak-f of
+ * peach_hash64.cuh, which needs fewer registers with CUDA 12.8.
  * Host code launches these kernels with PEACH_PIPE_BLOCK threads only. */
 #define PEACH_PIPE_LB_DEFAULT  __launch_bounds__(PEACH_PIPE_BLOCK)
 #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 12 || \
