@@ -46,17 +46,30 @@
 #define PEACH_CUDA_MODE_PIPELINE    1  /**< queued pipeline kernels */
 
 /* Pipeline batch sizing (see peach_cuda_sizing()) */
-#define PEACH_CUDA_NCTX             2  /**< batch contexts (streams) */
-#define PEACH_CUDA_SLOT_BYTES       ( sizeof(PEACH_PIPE_SLOT) + \
-   8 * sizeof(word32) + sizeof(word64) + \
+#define PEACH_CUDA_NCTX_MAX         4  /**< max. batch contexts, one
+   stream each (MCM_PEACH_STREAMS) */
+#define PEACH_CUDA_NCTX_AUTO        3  /**< batch contexts of the automatic
+   choice, fewer (not below PEACH_CUDA_NCTX_MIN) when the free memory
+   does not fit full batches for them */
+#define PEACH_CUDA_NCTX_MIN         2  /**< min. batch contexts of the
+   automatic choice */
+#define PEACH_CUDA_SLOT_BYTES       ( 2 * sizeof(PEACH_PIPE_SLOT) + \
+   8 * sizeof(word32) + sizeof(word64) + sizeof(word32) + \
    PEACH_PIPE_NQUEUE * sizeof(word32) )   /**< device bytes per slot and
-   context: slot 32 + hash0 32 + rng 8 + 17 queues x 4 = 140 */
-#define PEACH_CUDA_SLOTS_PER_THREAD 32 /**< default slots per resident
-   thread (N = 32 x SMs x maxThreadsPerSM) */
+   context: slot state 16 + queue entry 16 + hash0 32 + rng 8 + key 4 +
+   8 round 0 queues x 4 = 108 */
+#define PEACH_CUDA_SLOTS_PER_THREAD 32 /**< default slots per batch (each
+   batch context) per resident thread: N = 32 x SMs x maxThreadsPerSM.
+   Large batches fill the tile ordered queues densely, so that jumps to
+   neighbouring tiles share cache lines */
+#define PEACH_CUDA_MD2_BLOCKS       4  /**< max. resident blocks per SM of
+   the MD2 hash kernel with several batch contexts (fewer than its
+   occupancy allows, see peach_cuda_pipeline_setup()) */
 #define PEACH_CUDA_MEM_PERCENT      80 /**< max. share of free memory used
    by the batch contexts, in percent */
 #define PEACH_CUDA_BATCH_MAX        WORD32_C(0x1000000)  /**< hard upper
-   bound of slots per batch (keeps 17 x N queue indices in 32 bits) */
+   bound of slots per batch (PEACH_PIPE_MAXCAP: keeps the offsets of the
+   8 round 0 queues, 8 x N slot numbers, in 32 bits) */
 #define PEACH_CUDA_T_BYTES   (sizeof(word16) * PEACHCACHELEN)  /**< T */
 
 /* Pipeline solver safety and tuning */
@@ -64,8 +77,9 @@
    batch before the batch is skipped (host redraw rule) */
 #define PEACH_CUDA_BATCH_MS         250  /**< batch time limit, in ms; two
    slower batches in a row halve the slots of later batches. Measured
-   from enqueue to completion while the other context's batch shares the
-   GPU, so about twice the time of the batch alone */
+   from enqueue to completion while the batches of the other contexts
+   share the GPU, so about (contexts) times the time of the batch alone:
+   it bounds the GPU time in flight, which a block change waits for */
 #define PEACH_CUDA_BATCH_GROW       8    /**< consecutive batches faster
    than 2/5 of PEACH_CUDA_BATCH_MS (a doubled batch stays well below the
    limit) that double the slots again (up to cap) */
@@ -88,6 +102,11 @@
 #define PEACH_CUDA_SELFTEST_BYTES   ( sizeof(word32) * \
    PEACH_CUDA_SELFTEST_MAX * (PEACH_PIPE_SELFTEST_IN + \
    PEACH_PIPE_SELFTEST_OUT) )   /**< self-test buffer (in, then out) */
+#define PEACH_CUDA_SKIP_LATE_CC     12   /**< compute capability (major)
+   whose default skip masks evaluate MD2 jumps in the late rounds (see
+   peach_cuda_skip_default()); measured on sm_120 (RTX 5090) only */
+#define PEACH_CUDA_SKIP_LATE_ROUND  4    /**< first round of the late-MD2
+   default skip masks that keeps MD2 jumps (rounds 0..3 drop them) */
 
 /* Block trailer snapshot attempts (see peach_cuda_snapshot()) */
 #define PEACH_CUDA_SNAPSHOT_TRIES   64
@@ -100,8 +119,13 @@
 */
 typedef struct {
    /* official (legacy) solver */
-   cudaStream_t stream[2];             /**< asynchronous streams */
-   BTRAILER *h_bt[2], *d_bt[2];        /**< BTRAILER (current) */
+   cudaStream_t stream[PEACH_CUDA_NCTX_MAX];  /**< asynchronous streams:
+                                          0 and 1 (legacy solver, map
+                                          build), one per pipeline batch
+                                          context */
+   BTRAILER *h_bt[PEACH_CUDA_NCTX_MAX];  /**< BTRAILER (current), one per
+                                          stream (pinned) */
+   BTRAILER *d_bt[2];                  /**< BTRAILER (legacy, device) */
    word64 *h_solve[2], *d_solve[2];    /**< solve seeds */
    word64 *d_state[2];                 /**< PRNG state */
    word64 *d_map;                      /**< Peach Map */
@@ -111,7 +135,11 @@ typedef struct {
    /* configuration, read once by peach_init_cuda_device() */
    int cfg_legacy;                     /**< MCM_PEACH_LEGACY (1 = legacy) */
    word8 cfg_skip[8];                  /**< MCM_PEACH_SKIP, per round */
+   int cfg_skip_auto;                  /**< MCM_PEACH_SKIP unset: default
+                                          masks of the device (see
+                                          peach_cuda_skip_default()) */
    word32 cfg_batch;                   /**< MCM_PEACH_BATCH (0 = auto) */
+   int cfg_nctx;                       /**< MCM_PEACH_STREAMS (0 = auto) */
    /* solver mode and safety */
    int mode;                           /**< PEACH_CUDA_MODE_* in use */
    int fallback;                       /**< pipeline abandoned for the
@@ -123,6 +151,9 @@ typedef struct {
    /* device properties and pipeline sizing */
    int sms;                            /**< multiprocessor count */
    int max_threads_sm;                 /**< max threads per multiproc. */
+   int nctx;                           /**< pipeline batch contexts, 1..
+                                          PEACH_CUDA_NCTX_MAX (streams
+                                          0 .. nctx - 1) */
    word32 cap;                         /**< slots per context (queue
                                           capacity N) */
    word32 nslots;                      /**< slots per batch (adaptive,
@@ -151,13 +182,22 @@ typedef struct {
                                           on every batch launch (never 0) */
    PEACH_PIPE_LAUNCH launch;           /**< launch configuration */
    /* pipeline: per batch context (one per stream) */
-   PEACH_PIPE_PARAMS params[2];        /**< in-flight batch parameters */
-   PEACH_PIPE_BUFS bufs[2];            /**< batch device buffers (d_map,
-                                          d_T alias the per device ones) */
-   PEACH_PIPE_RESULT *h_res[2];        /**< pinned copy of the result */
-   cudaEvent_t ev_start[2], ev_stop[2];   /**< batch timing events */
-   word32 epoch_inflight[2];           /**< epoch of the in-flight batch */
-   int inflight[2];                    /**< batch launched, unharvested */
+   PEACH_PIPE_PARAMS params[PEACH_CUDA_NCTX_MAX];  /**< in-flight batch
+                                          parameters */
+   PEACH_PIPE_BUFS bufs[PEACH_CUDA_NCTX_MAX];  /**< batch device buffers
+                                          (d_map, d_T alias the per device
+                                          ones) */
+   PEACH_PIPE_RESULT *h_res[PEACH_CUDA_NCTX_MAX];  /**< pinned copy of the
+                                          result */
+   cudaEvent_t ev_start[PEACH_CUDA_NCTX_MAX];  /**< batch start events */
+   cudaEvent_t ev_stop[PEACH_CUDA_NCTX_MAX];   /**< batch stop events */
+   word32 epoch_inflight[PEACH_CUDA_NCTX_MAX];  /**< epoch of the
+                                          in-flight batch */
+   int inflight[PEACH_CUDA_NCTX_MAX];  /**< batch launched, unharvested */
+   int timed[PEACH_CUDA_NCTX_MAX];     /**< batch launched while every
+                                          other batch in flight had its
+                                          slots: its time counts for the
+                                          adaptive batch size */
    /* pipeline: counters */
    word64 batches;                     /**< batches since last DEV_INIT */
    word64 batches_total;               /**< batches since init */
@@ -1102,9 +1142,12 @@ static int peach_cuda_parse_uint(const char *s, const char *e,
  *   per-round skip masks of the pipeline solver: bit a drops a nonce
  *   whose jump in that round would use algorithm a (6 = MD2). One mask
  *   applies to all 8 rounds. Each mask 0..0xFE (0xFF would drop every
- *   nonce); default 0x40 in every round;
+ *   nonce); default automatic, per device (peach_cuda_skip_default());
  * - MCM_PEACH_BATCH=<slots> -- slots per pipeline batch, 0 = automatic;
- *   default 0 (see peach_cuda_sizing() for clamping).
+ *   default 0 (see peach_cuda_sizing() for clamping);
+ * - MCM_PEACH_STREAMS=<n> -- pipeline batch contexts (one stream each),
+ *   1..PEACH_CUDA_NCTX_MAX, 0 = automatic; default 0 (see
+ *   peach_cuda_sizing()).
  * Numbers are decimal, or hexadecimal with a 0x prefix. An empty
  * variable counts as unset.
  * @param ctx Pointer to DEVICE_CTX (for log messages)
@@ -1119,7 +1162,9 @@ static void peach_cuda_config(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
    /* defaults */
    P->cfg_legacy = 0;
    for (i = 0; i < 8; i++) P->cfg_skip[i] = PEACH_PIPE_SKIP_MD2;
+   P->cfg_skip_auto = 1;
    P->cfg_batch = 0;
+   P->cfg_nctx = 0;
 
    /* MCM_PEACH_LEGACY=0|1 */
    str = getenv("MCM_PEACH_LEGACY");
@@ -1148,6 +1193,7 @@ static void peach_cuda_config(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
       if (n == 1) for (i = 1; i < 8; i++) masks[i] = masks[0];
       if (n == 1 || n == 8) {
          for (i = 0; i < 8; i++) P->cfg_skip[i] = (word8) masks[i];
+         P->cfg_skip_auto = 0;
       } else {
          pwarn("CUDA #%d: ignoring invalid MCM_PEACH_SKIP=\"%.80s\""
             " (expected 1 or 8 comma separated masks, each 0..0xFE)",
@@ -1166,7 +1212,62 @@ static void peach_cuda_config(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
             " (expected a number of slots, 0 = automatic)", ctx->id, str);
       }
    }
+
+   /* MCM_PEACH_STREAMS=<n> */
+   str = getenv("MCM_PEACH_STREAMS");
+   if (str != NULL && *str != '\0') {
+      if (peach_cuda_parse_uint(str, str + strlen(str), PEACH_CUDA_NCTX_MAX,
+            &value) == 0) {
+         P->cfg_nctx = (int) value;
+      } else {
+         pwarn("CUDA #%d: ignoring invalid MCM_PEACH_STREAMS=\"%.32s\""
+            " (expected 0..%d, 0 = automatic)", ctx->id, str,
+            PEACH_CUDA_NCTX_MAX);
+      }
+   }
 }  /* end peach_cuda_config() */
+
+/**
+ * @private
+ * Default (automatic) skip masks of the pipeline solver for the current
+ * CUDA device, used when MCM_PEACH_SKIP is unset (or invalid): on
+ * devices of compute capability PEACH_CUDA_SKIP_LATE_CC.x, MD2 jumps are
+ * dropped in rounds 0..PEACH_CUDA_SKIP_LATE_ROUND - 1 and evaluated in
+ * the later rounds (masks 0x40 x 4, then 0x00 x 4); on every other
+ * device (not measured), MD2 jumps are dropped in every round (0x40 x 8).
+ * <br />
+ * An MD2 jump costs several other jumps, and dropping a nonce loses the
+ * jumps already spent on it. Early in its walk a nonce has cost little
+ * and most of its walk is still ahead, so dropping it and starting a
+ * fresh one is cheaper; late in its walk, finishing it with the MD2 jump
+ * is cheaper. A drop in round 0 costs only the init kernel (95% of
+ * nonces start on tile 0, and for some blocks about half of them jump
+ * with MD2 there). Measured on an RTX 5090 (sm_120) with the GPU A/B
+ * test: 79 M completed nonces/s with 0x40 x 4, 0x00 x 4, against 69 with
+ * 0x40 in every round and 73 with full evaluation (0x00).
+ * @param ctx Pointer to DEVICE_CTX (current CUDA device)
+ * @param P Pointer to Peach CUDA context (cfg_skip, cfg_skip_auto)
+ * @returns compute capability (major) of the device, 0 if unknown
+*/
+static int peach_cuda_skip_default(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
+{
+   int major = 0, i;
+
+   if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+         ctx->id) != cudaSuccess) {
+      /* clear the (non-sticky) error; keep the generic masks */
+      (void) cudaGetLastError();
+      major = 0;
+   }
+   if (P->cfg_skip_auto && major == PEACH_CUDA_SKIP_LATE_CC) {
+      for (i = 0; i < 8; i++) {
+         P->cfg_skip[i] = i < PEACH_CUDA_SKIP_LATE_ROUND ?
+            PEACH_PIPE_SKIP_MD2 : 0;
+      }
+   }
+
+   return major;
+}  /* end peach_cuda_skip_default() */
 
 /**
  * @private
@@ -1174,11 +1275,15 @@ static void peach_cuda_config(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
  * batch N = PEACH_CUDA_SLOTS_PER_THREAD x SMs x maxThreadsPerSM, or
  * MCM_PEACH_BATCH when set, clamped to [128 x SMs, memory limit] and
  * rounded to whole blocks of 128 slots; the memory limit wins when both
- * bounds conflict. The memory limit fits PEACH_CUDA_NCTX contexts of
- * PEACH_CUDA_SLOT_BYTES per slot into PEACH_CUDA_MEM_PERCENT percent of
- * the free device memory, minus @a reserve bytes still to be allocated,
- * and never exceeds PEACH_CUDA_BATCH_MAX slots.
- * Sets P->sms, P->max_threads_sm, P->cap, P->nslots and P->nslots_min.
+ * bounds conflict. The memory limit fits the batch contexts, of
+ * PEACH_CUDA_SLOT_BYTES per slot each, into PEACH_CUDA_MEM_PERCENT
+ * percent of the free device memory, minus @a reserve bytes still to be
+ * allocated, and never exceeds PEACH_CUDA_BATCH_MAX slots. Batch
+ * contexts: MCM_PEACH_STREAMS when set, else the most of
+ * PEACH_CUDA_NCTX_AUTO .. PEACH_CUDA_NCTX_MIN whose memory limit still
+ * fits N (else PEACH_CUDA_NCTX_MIN, with a smaller N).
+ * Sets P->sms, P->max_threads_sm, P->nctx, P->cap, P->nslots and
+ * P->nslots_min.
  * @param ctx Pointer to DEVICE_CTX (current CUDA device)
  * @param P Pointer to Peach CUDA context
  * @param reserve Device memory, in bytes, to leave for later allocations
@@ -1192,6 +1297,7 @@ static int peach_cuda_sizing(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P,
    size_t mfree, mtotal, avail, limit;
    word64 want, n;
    word32 lo, hi;
+   int nctx;
    cudaError_t err;
 
    mfree = mtotal = 0;
@@ -1215,24 +1321,30 @@ static int peach_cuda_sizing(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P,
       return VERROR;
    }
 
-   /* memory limit, in whole blocks of slots */
-   avail = mfree > reserve ? mfree - reserve : 0;
-   limit = avail / 100 * PEACH_CUDA_MEM_PERCENT /
-      (PEACH_CUDA_NCTX * PEACH_CUDA_SLOT_BYTES);
-   if (limit > PEACH_CUDA_BATCH_MAX) limit = PEACH_CUDA_BATCH_MAX;
-   hi = (word32) (limit & ~((size_t) PEACH_PIPE_BLOCK - 1));
+   /* batch contexts, slots per batch and memory limit, in whole blocks
+    * of slots: the configured contexts, else the most whose memory limit
+    * still fits the requested (or default) slots per batch, at least one
+    * block per SM */
    lo = (word32) P->sms * PEACH_PIPE_BLOCK;
+   avail = mfree > reserve ? mfree - reserve : 0;
+   want = P->cfg_batch ? (word64) P->cfg_batch : (word64) P->sms *
+      (word64) P->max_threads_sm * PEACH_CUDA_SLOTS_PER_THREAD;
+   for (nctx = P->cfg_nctx ? P->cfg_nctx : PEACH_CUDA_NCTX_AUTO; ; nctx--) {
+      n = want < lo ? lo : want;
+      n = (n + PEACH_PIPE_BLOCK - 1) & ~((word64) PEACH_PIPE_BLOCK - 1);
+      if (n > PEACH_CUDA_BATCH_MAX) n = PEACH_CUDA_BATCH_MAX;
+      limit = avail / 100 * PEACH_CUDA_MEM_PERCENT /
+         ((size_t) nctx * PEACH_CUDA_SLOT_BYTES);
+      if (limit > PEACH_CUDA_BATCH_MAX) limit = PEACH_CUDA_BATCH_MAX;
+      if (P->cfg_nctx || nctx <= PEACH_CUDA_NCTX_MIN || limit >= n) break;
+   }
+   P->nctx = nctx;
+   hi = (word32) (limit & ~((size_t) PEACH_PIPE_BLOCK - 1));
    if (hi < PEACH_PIPE_BLOCK) {
       pwarn("CUDA #%d: pipeline sizing failed: %llu MiB free memory",
          ctx->id, (unsigned long long) (mfree >> 20));
       return VERROR;
    }
-
-   /* requested (or default) slots, clamped and rounded to whole blocks */
-   want = P->cfg_batch ? (word64) P->cfg_batch : (word64) P->sms *
-      (word64) P->max_threads_sm * PEACH_CUDA_SLOTS_PER_THREAD;
-   n = want < lo ? lo : want;
-   n = (n + PEACH_PIPE_BLOCK - 1) & ~((word64) PEACH_PIPE_BLOCK - 1);
    if (n > hi) n = hi;
    P->cap = P->nslots = (word32) n;
    P->nslots_min = lo < P->cap ? lo : P->cap;
@@ -1243,8 +1355,8 @@ static int peach_cuda_sizing(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P,
       P->sms, P->max_threads_sm, P->cfg_batch ? "MCM_PEACH_BATCH" :
       "auto", (unsigned long long) want, (unsigned) P->cap,
       (unsigned) P->nslots_min, (unsigned) hi,
-      (unsigned) PEACH_CUDA_SLOT_BYTES, PEACH_CUDA_NCTX,
-      (unsigned long long) (((word64) P->cap * PEACH_CUDA_NCTX *
+      (unsigned) PEACH_CUDA_SLOT_BYTES, P->nctx,
+      (unsigned long long) (((word64) P->cap * (word64) P->nctx *
       PEACH_CUDA_SLOT_BYTES) >> 20), (unsigned long long) (mfree >> 20),
       (unsigned long long) (reserve >> 20));
 
@@ -1254,9 +1366,10 @@ static int peach_cuda_sizing(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P,
 /**
  * @private
  * Release the pipeline solver resources of a Peach CUDA context: the
- * events, pinned results and device buffers of both batch contexts, the
- * transition table and the self-test buffer. Every pointer and handle is
- * reset, so a second call does nothing. Legacy resources (streams, map,
+ * events, pinned results and device buffers of every batch context, the
+ * streams and pinned trailers beyond the two legacy ones, the transition
+ * table and the self-test buffer. Every pointer and handle is reset, so
+ * a second call does nothing. Legacy resources (streams 0 and 1, map,
  * legacy buffers) are not touched.
  * @param ctx Pointer to DEVICE_CTX (current CUDA device; for messages)
  * @param P Pointer to Peach CUDA context
@@ -1282,7 +1395,14 @@ static cudaError_t peach_cuda_pipeline_release(DEVICE_CTX *ctx,
    } while(0)
 
    first = cudaSuccess;
-   for (id = 0; id < PEACH_CUDA_NCTX; id++) {
+   for (id = 0; id < PEACH_CUDA_NCTX_MAX; id++) {
+      if (id >= 2) {
+         /* (streams and trailers 0 and 1 belong to the legacy solver) */
+         if (P->stream[id]) cuFREE(cudaStreamDestroy(P->stream[id]));
+         if (P->h_bt[id]) cuFREE(cudaFreeHost(P->h_bt[id]));
+         P->stream[id] = NULL;
+         P->h_bt[id] = NULL;
+      }
       if (P->ev_start[id]) cuFREE(cudaEventDestroy(P->ev_start[id]));
       if (P->ev_stop[id]) cuFREE(cudaEventDestroy(P->ev_stop[id]));
       if (P->h_res[id]) cuFREE(cudaFreeHost(P->h_res[id]));
@@ -1290,7 +1410,9 @@ static cudaError_t peach_cuda_pipeline_release(DEVICE_CTX *ctx,
       if (P->bufs[id].d_slot) cuFREE(cudaFree(P->bufs[id].d_slot));
       if (P->bufs[id].d_hash) cuFREE(cudaFree(P->bufs[id].d_hash));
       if (P->bufs[id].d_q) cuFREE(cudaFree(P->bufs[id].d_q));
+      if (P->bufs[id].d_ent) cuFREE(cudaFree(P->bufs[id].d_ent));
       if (P->bufs[id].d_cnt) cuFREE(cudaFree(P->bufs[id].d_cnt));
+      if (P->bufs[id].d_key) cuFREE(cudaFree(P->bufs[id].d_key));
       if (P->bufs[id].d_res) cuFREE(cudaFree(P->bufs[id].d_res));
       if (P->bufs[id].d_trace) cuFREE(cudaFree(P->bufs[id].d_trace));
       /* (bufs[id].d_map and bufs[id].d_T alias P->d_map and P->d_T) */
@@ -1332,11 +1454,13 @@ static int peach_cuda_grid(const PEACH_CUDA_CTX *P, int blocks)
  * Set up the pipeline solver of a device (called by
  * peach_init_cuda_device() after the legacy buffers, streams and the map
  * are allocated, before any other kernel launch): size the batches,
- * allocate the transition table, the self-test buffer and both batch
- * contexts (RNG states, slots, hash0, queues, counters, device result,
- * pinned host result, timing events), seed the RNG states of each
- * context (distinct seeds, exactly cap threads) and compute the grid of
- * every pipeline kernel from its occupancy.
+ * allocate the transition table, the self-test buffer and every batch
+ * context (stream and pinned trailer beyond the two legacy ones, RNG
+ * states, slots, hash0, queues, counters, device result, pinned host
+ * result, timing events), seed the RNG states of each context (distinct
+ * seeds, exactly cap threads) and compute the grid of every pipeline
+ * kernel from its occupancy: one wave of resident blocks, except the MD2
+ * kernel (at most PEACH_CUDA_MD2_BLOCKS blocks per SM).
  * @param ctx Pointer to DEVICE_CTX (current CUDA device)
  * @param P Pointer to Peach CUDA context
  * @returns VEOK on success, else VERROR (warned); the caller then
@@ -1345,7 +1469,7 @@ static int peach_cuda_grid(const PEACH_CUDA_CTX *P, int blocks)
 static int peach_cuda_pipeline_setup(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
 {
    PEACH_PIPE_BUFS *b;
-   word64 seed[PEACH_CUDA_NCTX];
+   word64 seed[PEACH_CUDA_NCTX_MAX];
    size_t cap;
    int nb[10], i, id;
    cudaError_t err;
@@ -1363,12 +1487,14 @@ static int peach_cuda_pipeline_setup(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
       } \
    } while(0)
 
-   /* batch size (sets P->sms, cap, nslots, nslots_min) */
+   /* batch size (sets P->sms, nctx, cap, nslots, nslots_min) */
    if (peach_cuda_sizing(ctx, P, PEACH_CUDA_T_BYTES +
-         PEACH_CUDA_SELFTEST_BYTES) != VEOK) {
+         PEACH_CUDA_SELFTEST_BYTES + (PEACH_CUDA_NCTX_MAX *
+         PEACH_PIPE_CNTWORDS * sizeof(word32))) != VEOK) {
       return VERROR;
    }
-   if (P->cap < PEACH_PIPE_BLOCK || (P->cap % PEACH_PIPE_BLOCK) != 0 ||
+   if (P->nctx < 1 || P->nctx > PEACH_CUDA_NCTX_MAX ||
+         P->cap < PEACH_PIPE_BLOCK || (P->cap % PEACH_PIPE_BLOCK) != 0 ||
          P->cap > PEACH_PIPE_MAXCAP) {
       pwarn("CUDA #%d: pipeline setup failed: invalid capacity %u",
          ctx->id, (unsigned) P->cap);
@@ -1381,22 +1507,33 @@ static int peach_cuda_pipeline_setup(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
    cuTRY(cudaMalloc((void **) &(P->d_selftest), PEACH_CUDA_SELFTEST_BYTES));
 
    /* distinct RNG seeds per batch context */
-   seed[0] = ((word64) rand32() << 32) | (word64) rand32();
-   do {
-      seed[1] = ((word64) rand32() << 32) | (word64) rand32();
-   } while (seed[1] == seed[0]);
+   for (id = 0; id < P->nctx; id++) {
+      do {
+         seed[id] = ((word64) rand32() << 32) | (word64) rand32();
+         for (i = 0; i < id && seed[i] != seed[id]; i++);
+      } while (i < id);
+   }
 
    /* per batch context (one per stream) */
-   for (id = 0; id < PEACH_CUDA_NCTX; id++) {
+   for (id = 0; id < P->nctx; id++) {
       b = &(P->bufs[id]);
+      if (id >= 2) {
+         /* stream and trailer snapshot beyond the two legacy ones */
+         cuTRY(cudaStreamCreate(&(P->stream[id])));
+         cuTRY(cudaMallocHost((void **) &(P->h_bt[id]), sizeof(BTRAILER)));
+         memset(P->h_bt[id], 0, sizeof(BTRAILER));
+      }
       cuTRY(cudaMalloc((void **) &(b->d_rng), cap * sizeof(word64)));
       cuTRY(cudaMalloc((void **) &(b->d_slot),
          cap * sizeof(PEACH_PIPE_SLOT)));
       cuTRY(cudaMalloc((void **) &(b->d_hash), cap * 8 * sizeof(word32)));
       cuTRY(cudaMalloc((void **) &(b->d_q),
          cap * PEACH_PIPE_NQUEUE * sizeof(word32)));
+      cuTRY(cudaMalloc((void **) &(b->d_ent),
+         cap * sizeof(PEACH_PIPE_SLOT)));
       cuTRY(cudaMalloc((void **) &(b->d_cnt),
-         PEACH_PIPE_NCNT * PEACH_PIPE_CNTPAD * sizeof(word32)));
+         PEACH_PIPE_CNTWORDS * sizeof(word32)));
+      cuTRY(cudaMalloc((void **) &(b->d_key), cap * sizeof(word32)));
       cuTRY(cudaMalloc((void **) &(b->d_res), sizeof(PEACH_PIPE_RESULT)));
       cuTRY(cudaMallocHost((void **) &(P->h_res[id]),
          sizeof(PEACH_PIPE_RESULT)));
@@ -1443,6 +1580,18 @@ static int peach_cuda_pipeline_setup(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
             " %d threads per block", ctx->id, i, PEACH_PIPE_BLOCK);
          return VERROR;
       }
+   }
+   /* MD2 is bound by the rate of shared memory loads and a hash takes
+    * about 1 ms per thread, the other hash kernels are bound by memory:
+    * with several batch contexts, fewer resident MD2 blocks per SM than
+    * its occupancy leave room on every SM for the kernels of the other
+    * contexts (RTX 5090, full evaluation: 4 instead of 5 blocks per SM
+    * gave +8% completed nonces/s; 2 or 3 blocks were slower). A single
+    * context has no other kernels to fill that room: MD2 keeps its
+    * occupancy (RTX 5090, MCM_PEACH_STREAMS=1: 4 blocks per SM were
+    * 5-8% slower than 5) */
+   if (P->nctx > 1 && nb[6] > PEACH_CUDA_MD2_BLOCKS) {
+      nb[6] = PEACH_CUDA_MD2_BLOCKS;
    }
    P->launch.block = PEACH_PIPE_BLOCK;
    for (i = 0; i < 8; i++) P->launch.grid_hash[i] = peach_cuda_grid(P, nb[i]);
@@ -1602,7 +1751,7 @@ int peach_free_cuda_device(DEVICE_CTX *ctx)
  * with peach_free_cuda_device(); this also releases a context whose
  * initialization failed.
  * @note Unless MCM_PEACH_LEGACY=1, also sets up the pipeline solver
- * (transition table and two batch contexts). If that setup fails, the
+ * (transition table and its batch contexts). If that setup fails, the
  * device is still initialized, with the official (legacy) solver, whose
  * resources are always allocated.
 */
@@ -1611,8 +1760,8 @@ int peach_init_cuda_device(DEVICE_CTX *ctx)
    PEACH_CUDA_CTX *p_ctx;
    const char *reason;
    size_t btsz, seedsz;
-   int grid, block, i;
-   char skip[48], batch[16];
+   int grid, block, major, i, n;
+   char skip[96], batch[16], streams[16];
 
 #undef cuCHK
 #define cuCHK(cuFN) \
@@ -1652,6 +1801,8 @@ int peach_init_cuda_device(DEVICE_CTX *ctx)
 
    /* set context to CUDA id */
    cuCHK(cudaSetDevice(ctx->id));
+   /* device dependent default skip masks (MCM_PEACH_SKIP unset) */
+   major = peach_cuda_skip_default(ctx, p_ctx);
    /* determine CUDA occupancy for device */
    cuCHK(cudaOccupancyMaxPotentialBlockSize(&grid, &block, kcu_peach_solve, 0, 0));
    /* store grid/block and calculate threads and state sizes */
@@ -1716,25 +1867,37 @@ int peach_init_cuda_device(DEVICE_CTX *ctx)
    for (i = 1; i < 8; i++) {
       if (p_ctx->cfg_skip[i] != p_ctx->cfg_skip[0]) break;
    }
+   /* (automatic masks: "auto(cc <major>: <masks>)") */
+   n = 0;
+   if (p_ctx->cfg_skip_auto) {
+      n = snprintf(skip, sizeof(skip), "auto(cc %d: ", major);
+      if (n < 0 || n >= (int) sizeof(skip)) n = 0;
+   }
    if (i == 8) {
-      snprintf(skip, sizeof(skip), "0x%02x", (unsigned) p_ctx->cfg_skip[0]);
+      snprintf(skip + n, sizeof(skip) - (size_t) n, "0x%02x%s",
+         (unsigned) p_ctx->cfg_skip[0], p_ctx->cfg_skip_auto ? ")" : "");
    } else {
-      snprintf(skip, sizeof(skip),
-         "0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x",
+      snprintf(skip + n, sizeof(skip) - (size_t) n,
+         "0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x%s",
          (unsigned) p_ctx->cfg_skip[0], (unsigned) p_ctx->cfg_skip[1],
          (unsigned) p_ctx->cfg_skip[2], (unsigned) p_ctx->cfg_skip[3],
          (unsigned) p_ctx->cfg_skip[4], (unsigned) p_ctx->cfg_skip[5],
-         (unsigned) p_ctx->cfg_skip[6], (unsigned) p_ctx->cfg_skip[7]);
+         (unsigned) p_ctx->cfg_skip[6], (unsigned) p_ctx->cfg_skip[7],
+         p_ctx->cfg_skip_auto ? ")" : "");
    }
    if (p_ctx->cfg_batch) {
       snprintf(batch, sizeof(batch), "%lu", (unsigned long) p_ctx->cfg_batch);
    } else snprintf(batch, sizeof(batch), "auto");
+   if (p_ctx->cfg_nctx) {
+      snprintf(streams, sizeof(streams), "%d", p_ctx->cfg_nctx);
+   } else snprintf(streams, sizeof(streams), "auto");
    if (p_ctx->mode == PEACH_CUDA_MODE_PIPELINE) {
       plog("CUDA #%d: Peach solver: pipeline; MCM_PEACH_SKIP=%s"
-         " MCM_PEACH_BATCH=%s; N = %u slots/batch (min %u) x %d contexts;"
-         " grids x%d: init %d, hash %d,%d,%d,%d,%d,%d,%d,%d, final %d",
-         ctx->id, skip, batch, (unsigned) p_ctx->nslots,
-         (unsigned) p_ctx->nslots_min, PEACH_CUDA_NCTX,
+         " MCM_PEACH_BATCH=%s MCM_PEACH_STREAMS=%s; N = %u slots/batch"
+         " (min %u) x %d contexts; grids x%d: init %d,"
+         " hash %d,%d,%d,%d,%d,%d,%d,%d, final %d",
+         ctx->id, skip, batch, streams, (unsigned) p_ctx->nslots,
+         (unsigned) p_ctx->nslots_min, p_ctx->nctx,
          p_ctx->launch.block, p_ctx->launch.grid_init,
          p_ctx->launch.grid_hash[0], p_ctx->launch.grid_hash[1],
          p_ctx->launch.grid_hash[2], p_ctx->launch.grid_hash[3],
@@ -1743,8 +1906,8 @@ int peach_init_cuda_device(DEVICE_CTX *ctx)
          p_ctx->launch.grid_final);
    } else {
       plog("CUDA #%d: Peach solver: legacy kernel (%s); pipeline options"
-         " (unused): MCM_PEACH_SKIP=%s MCM_PEACH_BATCH=%s", ctx->id,
-         reason, skip, batch);
+         " (unused): MCM_PEACH_SKIP=%s MCM_PEACH_BATCH=%s"
+         " MCM_PEACH_STREAMS=%s", ctx->id, reason, skip, batch, streams);
    }
 
    /* set device as initialized */
@@ -1942,7 +2105,9 @@ static int peach_solve_cuda_legacy(DEVICE_CTX *ctx, const BTRAILER *bt,
  * the device is initialized again: alert once with the reason, discard
  * every batch in flight (no pipeline candidate is reported afterwards),
  * and restart at DEV_INIT with ctx->work = 0, so that the legacy solver
- * waits for both streams and rebuilds its own state (map included).
+ * waits for its two streams and rebuilds its own state (map included).
+ * Batches still running on the other pipeline streams only read the map
+ * and write their own buffers; their results are never harvested.
  * @param ctx Pointer to DEVICE_CTX
  * @param P Pointer to its Peach CUDA context
  * @param reason Reason, for the alert
@@ -1956,7 +2121,7 @@ static int peach_cuda_fallback(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P,
          " legacy solver", ctx->id, reason);
    }
    P->fallback = 1;
-   P->inflight[0] = P->inflight[1] = 0;
+   memset(P->inflight, 0, sizeof(P->inflight));
    P->build_next = 0;
    ctx->status = DEV_INIT;
    ctx->work = 0;
@@ -1967,7 +2132,7 @@ static int peach_cuda_fallback(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P,
 /**
  * @private
  * Pipeline self-test, after every map build (the map and the transition
- * table are complete and both streams are idle). Compares with the same
+ * table are complete and all streams are idle). Compares with the same
  * code on the CPU:
  * - the transition table entries of tiles 0, 1, 0xFFFFF and 3 random
  *   tiles with peach_transition_tile() over the device's own tiles;
@@ -2118,7 +2283,11 @@ static int peach_cuda_selftest(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P,
  * overflow or prefix anomaly abandons the pipeline solver; two batches in
  * a row slower than PEACH_CUDA_BATCH_MS halve the slots of later batches
  * (not below nslots_min), and PEACH_CUDA_BATCH_GROW fast batches in a row
- * double them again (up to cap); the canary (final queue entry 0) is
+ * double them again (up to cap), counting only batches launched with the
+ * current slots while every other batch in flight had them too
+ * (P->timed[id]: with several contexts, batches launched before a change
+ * are still in flight after it, and they slow down the batches next to
+ * them); the canary (one final queue entry, see peach_pipe_canary()) is
  * verified on the CPU for the first PEACH_CUDA_CANARY_FIRST batches after
  * a map build, then every PEACH_CUDA_CANARY_EVERY-th batch; a solve is
  * composed from the batch's own trailer snapshot h_bt[id] (incl. its
@@ -2167,8 +2336,14 @@ static int peach_cuda_harvest(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
    /* adaptive batch size: two slow batches in a row halve later batches
     * (a single outlier is ignored); a run of batches fast enough to stay
     * well below the limit when doubled (2/5 of it) doubles them again, up
-    * to the capacity */
-   if (cudaEventElapsedTime(&ms, P->ev_start[id], P->ev_stop[id]) !=
+    * to the capacity. A batch launched with other slots than the current
+    * ones (before a change), or while a batch with other slots was in
+    * flight (which shares the GPU with it and slows it down), does not
+    * count */
+   if (P->params[id].nslots != P->nslots || !P->timed[id]) {
+      /* launched before the last change, or timed with batches of
+       * another size on the GPU: says nothing about the current size */
+   } else if (cudaEventElapsedTime(&ms, P->ev_start[id], P->ev_stop[id]) !=
          cudaSuccess) {
       (void) cudaGetLastError();  /* no timing: keep the batch size */
    } else if (ms > (float) PEACH_CUDA_BATCH_MS) {
@@ -2198,7 +2373,7 @@ static int peach_cuda_harvest(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
       }
    }
 
-   /* canary: final queue entry 0 vs the CPU reference */
+   /* canary (a final queue entry, peach_pipe_canary()) vs the CPU */
    if (res.canary_valid && (P->batches <= PEACH_CUDA_CANARY_FIRST ||
          (P->batches % PEACH_CUDA_CANARY_EVERY) == 0)) {
       P->canary_checks++;
@@ -2259,7 +2434,7 @@ static int peach_cuda_launch(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
    PEACH_PIPE_PARAMS *p;
    SHA256_CTX sctx;
    word32 nlo[4], q;
-   int draws, nanf, rc;
+   int draws, nanf, rc, i;
    cudaError_t err;
 
 #undef cuCHK
@@ -2332,6 +2507,16 @@ static int peach_cuda_launch(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
    cuCHK(cudaEventRecord(P->ev_stop[id], P->stream[id]));
    P->epoch_inflight[id] = p->epoch;
    P->inflight[id] = 1;
+   /* its time counts only if every other batch in flight has its slots
+    * (no batch of another size can start while it runs: P->nslots
+    * changes only at a harvest, after which this batch no longer has
+    * the current size) */
+   P->timed[id] = 1;
+   for (i = 0; i < P->nctx; i++) {
+      if (i != id && P->inflight[i] && P->params[i].nslots != p->nslots) {
+         P->timed[id] = 0;
+      }
+   }
 
    return 0;
 }  /* end peach_cuda_launch() */
@@ -2390,12 +2575,44 @@ static int peach_cuda_reportable(const PEACH_CUDA_CTX *P, int id)
 
 /**
  * @private
- * Pipeline Peach CUDA solver: the official state machine on two streams,
- * with one pipeline batch context per stream, and these rules:
+ * Check that every stream of a device other than @a id is idle: the two
+ * legacy streams and the stream of every pipeline batch context.
+ * @param P Pointer to Peach CUDA context
+ * @param id Stream to leave out, or (-1)
+ * @param errp Pointer to place a CUDA error (other than
+ * cudaErrorNotReady), else cudaSuccess
+ * @returns 1 if they are all idle, else 0 (busy, or a CUDA error)
+*/
+static int peach_cuda_idle(const PEACH_CUDA_CTX *P, int id,
+   cudaError_t *errp)
+{
+   cudaError_t err;
+   int i, n;
+
+   *errp = cudaSuccess;
+   n = P->nctx > 2 ? P->nctx : 2;
+   for (i = 0; i < n; i++) {
+      if (i == id) continue;
+      err = cudaStreamQuery(P->stream[i]);
+      if (err == cudaErrorNotReady) return 0;
+      if (err != cudaSuccess) {
+         *errp = err;
+         return 0;
+      }
+   }
+
+   return 1;
+}  /* end peach_cuda_idle() */
+
+/**
+ * @private
+ * Pipeline Peach CUDA solver: the official state machine, with one
+ * pipeline batch context per stream (P->nctx streams; the map is built
+ * on streams 0 and 1, as official), and these rules:
  * - DEV_INIT: the map build cursor is P->build_next (ctx->work counts
- *   hashes only); the pre-build (both streams idle) discards every batch
+ *   hashes only); the pre-build (all streams idle) discards every batch
  *   result and records the phash of the map; when the map is complete and
- *   both streams are idle, the transition table is built and
+ *   all streams are idle, the transition table is built and
  *   synchronized, then the self-test runs, then DEV_IDLE;
  * - DEV_IDLE -> DEV_WORK gate as official;
  * - DEV_WORK, per idle stream, in this order: a trailer phash other than
@@ -2459,12 +2676,13 @@ static int peach_solve_cuda_pipeline(DEVICE_CTX *ctx, const BTRAILER *bt,
 
          /* check pre-build state */
          if (P->build_next == 0 && build == 0) {
-            /* ensure secondary stream is ready */
-            err = cudaStreamQuery(P->stream[id ^ 1]);
-            if (err == cudaErrorNotReady) break;
-            cuCHK(err);
+            /* ensure every other stream is ready */
+            if (!peach_cuda_idle(P, id, &err)) {
+               cuCHK(err);
+               break;
+            }
             /* discard every batch result and in-flight state */
-            for (i = 0; i < PEACH_CUDA_NCTX; i++) {
+            for (i = 0; i < P->nctx; i++) {
                cuCHK(cudaMemset(P->bufs[i].d_res, 0,
                   sizeof(PEACH_PIPE_RESULT)));
                memset(P->h_res[i], 0, sizeof(PEACH_PIPE_RESULT));
@@ -2500,11 +2718,12 @@ static int peach_solve_cuda_pipeline(DEVICE_CTX *ctx, const BTRAILER *bt,
                /* update build progress (map/T cursor, not ctx->work) */
                P->build_next += (word32) grid * (word32) block;
             } else {
-               /* ensure secondary stream is finished */
-               err = cudaStreamQuery(P->stream[id ^ 1]);
-               if (err == cudaErrorNotReady) break;
-               cuCHK(err);
-               /* the map is complete and both streams are idle: build
+               /* ensure every other stream is finished */
+               if (!peach_cuda_idle(P, id, &err)) {
+                  cuCHK(err);
+                  break;
+               }
+               /* the map is complete and all streams are idle: build
                 * the transition table and wait for it */
                CUDA_KERNEL(kcu_peach_pipe_transitions,
                   PEACHCACHELEN / PEACH_PIPE_BLOCK, PEACH_PIPE_BLOCK, 0,
@@ -2547,14 +2766,14 @@ static int peach_solve_cuda_pipeline(DEVICE_CTX *ctx, const BTRAILER *bt,
 
    /* solve work in block trailer */
    if (ctx->status == DEV_WORK) {
-      for (id = 0; id < 2; id++) {
+      for (id = 0; id < P->nctx; id++) {
          err = cudaStreamQuery(P->stream[id]);
          if (err == cudaErrorNotReady) continue;
          cuCHK(err);
          /* (1) block update: the map (and T) is for another phash;
           * results in flight are discarded */
          if (memcmp(P->map_phash, bt->phash, HASHLEN)) {
-            P->inflight[0] = P->inflight[1] = 0;
+            memset(P->inflight, 0, sizeof(P->inflight));
             ctx->status = DEV_INIT;
             ctx->work = 0;
             P->build_next = 0;
@@ -2568,7 +2787,7 @@ static int peach_solve_cuda_pipeline(DEVICE_CTX *ctx, const BTRAILER *bt,
           */
          if (get32(bt->tcount) == 0 || cmp64(bt->bnum, btout->bnum) == 0 ||
                difftime(time(NULL), get32(bt->time0)) >= BRIDGEv3) {
-            P->inflight[0] = P->inflight[1] = 0;
+            memset(P->inflight, 0, sizeof(P->inflight));
             ctx->status = DEV_IDLE;
             ctx->work = 0;
             break;
@@ -2586,7 +2805,7 @@ static int peach_solve_cuda_pipeline(DEVICE_CTX *ctx, const BTRAILER *bt,
          /* update hashrate (completed nonces) */
          delta = difftime(time(NULL), ctx->last);
          ctx->hps = ctx->work / (delta ? delta : 1);
-      }  /* end for(id = 0; id < 2; id++)... */
+      }  /* end for(id = 0; id < P->nctx; id++)... */
    }  /* end if (ctx->status == DEV_WORK)... */
 
    return VERROR;

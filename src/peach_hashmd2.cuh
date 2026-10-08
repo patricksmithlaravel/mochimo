@@ -193,7 +193,7 @@ PEACH_DEV void peach_sh_md2(const word32 *n, word32 m, const uint4 *tile,
    c[0] = c[1] = c[2] = c[3] = c[4] = c[5] = c[6] = c[7] = 0;
    c[8] = c[9] = c[10] = c[11] = c[12] = c[13] = c[14] = c[15] = 0;
    /* first tile load, latency hidden behind the 2 nonce blocks */
-   v = PEACH_LDG128(&tile[0]);
+   v = PEACH_LDGTILE(&tile[0]);
    /* blocks 0, 1: nonce */
    peach_md2_block(x, c, n[0], n[1], n[2], n[3], sbox);
    peach_md2_block(x, c, n[4], n[5], n[6], n[7], sbox);
@@ -206,7 +206,7 @@ PEACH_DEV void peach_sh_md2(const word32 *n, word32 m, const uint4 *tile,
       w2 = v.y;
       w3 = v.z;
       carry = v.w;
-      if (i < 63) v = PEACH_LDG128(&tile[i + 1]);
+      if (i < 63) v = PEACH_LDGTILE(&tile[i + 1]);
       peach_md2_block(x, c, w0, w1, w2, w3, sbox);
    }
    /* block 66: last seed word (t[63].w) || 12 bytes of value 12 */

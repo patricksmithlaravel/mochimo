@@ -23,7 +23,9 @@
  * (0) peach_checkhash_cuda() vs peach_checkhash() (CPU);
  * (1) legacy: map build, solves at a low difficulty;
  * (2) pipeline: map + T build and self-test, solves, ctx->work grows by
- *     completed nonces (not launched slots), adaptive batch size;
+ *     completed nonces (not launched slots), adaptive batch size (also
+ *     with batches of the old size still in flight after a halving,
+ *     which slow down the batches next to them: one halving only);
  * (3) block changes (new phash) while batches are in flight, after they
  *     completed unharvested, while a stream is stuck, and during a map
  *     build: no solve for an old block, the map is rebuilt; a stream
@@ -43,7 +45,12 @@
  *     A/B test), and a second device initialized after a failed one
  *     (gpuminer) gets the configured solver;
  * (7) peach_free_cuda_device() + re-initialization with another
- *     configuration; no leaks, double frees or invalid handles;
+ *     configuration; no leaks, double frees or invalid handles; the
+ *     automatic skip masks per compute capability (8.x, 12.x) and
+ *     explicit masks, with their names in the init log line; the MD2
+ *     grid (at most PEACH_CUDA_MD2_BLOCKS blocks per SM with several
+ *     batch contexts, its occupancy with one); MCM_PEACH_STREAMS = 1 to 4
+ *     and invalid values (automatic);
  * (8) pipeline: a trailer with difficulty 0: every final hash solves (as
  *     consensus and the legacy solver), solves are verified;
  * (9) pipeline: polling intervals of seconds (gpuminer -d); a pause of
@@ -57,9 +64,11 @@
  * map: phash, clamped difficulty, a new epoch, the first nonce half
  * (valid haiku without a NaN replacement, q), midstate, tail, skip masks
  * and slots; the transition table must be built from the complete map
- * once both streams finished their map chunks, and must be finished
- * before a batch starts. peach_pipeline_cuda_device() must agree with
- * the mode.
+ * once every other stream is idle (map chunks and batches finished), and
+ * must be finished before a batch starts. peach_pipeline_cuda_device()
+ * must agree with the mode. Pipeline mode runs with the automatic number
+ * of batch contexts (streams), PEACH_CUDA_NCTX_AUTO on the fake device;
+ * scenario (7) also runs 1 to 4 contexts.
  * <br />
  * Map builds: the first build of a phash runs the real kcu_peach_build()
  * on all tiles in worker processes; the map is cached (per phash), and
@@ -69,7 +78,9 @@
  * Environment: PEACH_TEST_HOST_PROCS (worker processes, default 4),
  * PEACH_TEST_HOST_CACHE (cached maps, 0..2, default 2; 1 GiB each),
  * PEACH_TEST_HOST_VERBOSE=1 (log of the code under test, launches),
- * PEACH_TEST_HOST_ONLY=legacy|pipeline (only these scenarios).
+ * PEACH_TEST_HOST_ONLY=legacy|pipeline (only these scenarios),
+ * PEACH_TEST_HOST_STREAMS=<n> (MCM_PEACH_STREAMS of every scenario but
+ * the checks of (7) that set it themselves; default unset: automatic).
  * @copyright Adequate Systems LLC, 2018-2025. All Rights Reserved.
  * <br />For license information, please refer to ../../LICENSE.md
 */
@@ -219,6 +230,7 @@ static int Nresults;
 static unsigned long Nlog[PLOG_DEBUG + 1];
 static char LastAlert[512];
 static char LastWarn[512];
+static char LastInfo[512];
 
 /**
  * Log function of the code under test (replaces plogx()): counts every
@@ -243,6 +255,7 @@ static void peach_host_plogx(int ll, const char *file, int line,
    Nlog[ll]++;
    if (ll == PLOG_ALERT) snprintf(LastAlert, sizeof(LastAlert), "%s", msg);
    if (ll == PLOG_WARN) snprintf(LastWarn, sizeof(LastWarn), "%s", msg);
+   if (ll == PLOG_INFO) snprintf(LastInfo, sizeof(LastInfo), "%s", msg);
    if (ll <= PLOG_WARN || Verbose) {
       printf("   [peach.cu %s] %s\n", name[ll], msg);
       fflush(stdout);
@@ -300,6 +313,9 @@ static void env_set(const char *name, const char *value)
    else unsetenv(name);
 }  /* end env_set() */
 
+/* MCM_PEACH_STREAMS of the next peach_init_cuda_device() (NULL: unset) */
+static const char *Streams;
+
 /**
  * Solver configuration for the next peach_init_cuda_device().
 */
@@ -309,6 +325,7 @@ static void env_config(const char *legacy, const char *skip,
    env_set("MCM_PEACH_LEGACY", legacy);
    env_set("MCM_PEACH_SKIP", skip);
    env_set("MCM_PEACH_BATCH", batch);
+   env_set("MCM_PEACH_STREAMS", Streams);
 }  /* end env_config() */
 
 /* deterministic test RNG (SplitMix64) */
@@ -626,6 +643,20 @@ static struct {
 #define PCTX   ((PEACH_CUDA_CTX *) R.dev.peach)
 
 static int pipeline_active(void);
+
+/**
+ * Pipeline batch context of stream @a s (P->stream[0 .. nctx - 1]).
+ * @returns the context number, or (-1) for another stream
+*/
+static int ctx_of_stream(const PEACH_CUDA_CTX *P, cudaStream_t s)
+{
+   int id;
+
+   for (id = 0; id < P->nctx; id++) {
+      if (P->stream[id] == s) return id;
+   }
+   return (-1);
+}  /* end ctx_of_stream() */
 
 /**
  * Make a fresh candidate trailer of block @a bnum on phash variant
@@ -946,8 +977,11 @@ static struct {
    int have_captured;
    int track;              /* sum up completed nonces */
    word64 fin_sum;         /* completed, finished batches (tracked) */
-   word64 last[2];         /* completed of each stream's last batch */
+   word64 last[PEACH_CUDA_NCTX_MAX];   /* completed of each context's
+                                          last batch */
    unsigned long fin;      /* finished batches (tracked) */
+   word32 contend;         /* batch time model (contend_batch()): slots
+                              of a slow batch, 0 = off */
 } Fx;
 
 /**
@@ -966,8 +1000,9 @@ static void corrupt_T(void)
 /**
  * Checks of the transition table launch (called by its redirection,
  * before it runs): the map is complete for the phash recorded by the
- * solver, the other stream finished its map chunks, the launch covers
- * the whole table of the device. Records the map of the table.
+ * solver, every other stream (map chunks on streams 0 and 1, batches on
+ * the stream of every batch context) is idle, the launch covers the
+ * whole table of the device. Records the map of the table.
 */
 static void check_transitions_launch(const uint4 *d_map, word16 *d_T,
    word32 offset, word32 count)
@@ -994,10 +1029,11 @@ static void check_transitions_launch(const uint4 *d_map, word16 *d_T,
       " other buffers than the device's map and table");
    CHECK(memcmp(Bmap.phash, P->map_phash, HASHLEN) == 0, "transition table"
       " launched for a map of another phash than map_phash");
-   for (i = 0; i < 2; i++) {
+   for (i = 0; i < (P->nctx > 2 ? P->nctx : 2); i++) {
       if (P->stream[i] == s) continue;
       CHECK(emu_rt_stream_busy(P->stream[i]) == 0, "transition table"
-         " launched while stream %d may still build the map", i);
+         " launched while stream %d may still build the map or run a"
+         " batch", i);
    }
 }  /* end check_transitions_launch() */
 
@@ -1021,7 +1057,7 @@ static void check_batch_launch(cudaStream_t s)
    word32 nlo[4], q;
    int id, nanf;
 
-   id = s == P->stream[0] ? 0 : s == P->stream[1] ? 1 : -1;
+   id = ctx_of_stream(P, s);
    CHECK(id >= 0, "pipeline batch launched on an unknown stream");
    if (id < 0) return;
    Bchk.batches++;
@@ -1077,6 +1113,34 @@ static void check_batch_launch(cudaStream_t s)
 }  /* end check_batch_launch() */
 
 /**
+ * Batch time model of the adaptive batch size check with batches of two
+ * sizes in flight (Fx.contend, called after the init kernel of a batch
+ * on stream @a s was enqueued): a batch of Fx.contend slots or more
+ * takes 400 ms (slow); a smaller batch takes 300 ms (slow) if another
+ * stream is still busy with a larger batch, which shares the GPU with
+ * it, else 150 ms (neither slow nor fast enough to grow). Sets the time
+ * of the final kernel, which the same peach_pipe_enqueue() call enqueues
+ * next on @a s.
+*/
+static void contend_batch(cudaStream_t s)
+{
+   PEACH_CUDA_CTX *P = PCTX;
+   const EMU_RT__STREAM *o;
+   double ms;
+   int id, i;
+
+   id = ctx_of_stream(P, s);
+   if (id < 0) return;
+   ms = P->params[id].nslots >= Fx.contend ? 400.0 : 150.0;
+   for (i = 0; i < P->nctx && ms < 300.0; i++) {
+      o = emu_stream(P->stream[i]);
+      if (i != id && o != NULL && emu_rt__busy(o) &&
+            P->params[i].nslots > P->params[id].nslots) ms = 300.0;
+   }
+   emu_rt_kcfg("kcu_peach_pipe_final", 1)->ms = ms;
+}  /* end contend_batch() */
+
+/**
  * Post-launch hook of the fake runtime.
 */
 static void on_launch(const char *name, cudaStream_t s, void *user)
@@ -1090,6 +1154,7 @@ static void on_launch(const char *name, cudaStream_t s, void *user)
    if (P == NULL) return;
    if (strcmp(name, "kcu_peach_pipe_init") == 0) {
       check_batch_launch(s);
+      if (Fx.contend) contend_batch(s);
       return;
    }
    if (strcmp(name, "kcu_peach_pipe_transitions") == 0 &&
@@ -1102,7 +1167,7 @@ static void on_launch(const char *name, cudaStream_t s, void *user)
       return;
    }
    if (strcmp(name, "kcu_peach_pipe_final") != 0) return;
-   id = s == P->stream[0] ? 0 : s == P->stream[1] ? 1 : -1;
+   id = ctx_of_stream(P, s);
    if (id < 0 || P->bufs[id].d_res == NULL) return;
    res = P->bufs[id].d_res;
    Fx.last[id] = res->completed;
@@ -1647,12 +1712,12 @@ static void scenarios_legacy(void)
 */
 static void pipeline_work_check(void)
 {
-   word64 w0, dw, pre;
+   word64 w0, dw, pre, post;
    int i, steady = 1;
 
    rig_candidate(DIFF_NEVER);
    for (i = 0; i < 4; i++) rig_poll();
-   pre = Fx.last[0] + Fx.last[1];
+   for (pre = 0, i = 0; i < PEACH_CUDA_NCTX_MAX; i++) pre += Fx.last[i];
    w0 = R.dev.work;
    Fx.fin_sum = 0;
    Fx.fin = 0;
@@ -1670,7 +1735,8 @@ static void pipeline_work_check(void)
       " of the batches (%llu + %llu in flight before)",
       (unsigned long long) dw, (unsigned long long) Fx.fin_sum,
       (unsigned long long) pre);
-   CHECK(dw + Fx.last[0] + Fx.last[1] >= Fx.fin_sum, "work +%llu is short"
+   for (post = 0, i = 0; i < PEACH_CUDA_NCTX_MAX; i++) post += Fx.last[i];
+   CHECK(dw + post >= Fx.fin_sum, "work +%llu is short"
       " of the completed nonces %llu of %lu batches",
       (unsigned long long) dw, (unsigned long long) Fx.fin_sum, Fx.fin);
    printf("   work +%llu over %lu batches (completed %llu)\n",
@@ -1678,7 +1744,7 @@ static void pipeline_work_check(void)
 }  /* end pipeline_work_check() */
 
 /**
- * Predicate: both pipeline batch contexts have a batch of the current
+ * Predicate: every pipeline batch context has a batch of the current
  * trailer in flight.
 */
 static int pred_inflight(void)
@@ -1687,7 +1753,7 @@ static int pred_inflight(void)
    int id;
 
    if (P == NULL || R.dev.status != DEV_WORK) return 0;
-   for (id = 0; id < 2; id++) {
+   for (id = 0; id < P->nctx; id++) {
       if (!P->inflight[id] || memcmp(P->h_bt[id], &R.bt, 92) != 0) return 0;
    }
    return 1;
@@ -1759,9 +1825,9 @@ static void scenario_polling(void)
    rc = rig_poll();
    CHECK(rc != VEOK, "(b) solve reported for a trailer gpuminer cannot"
       " send");
-   CHECK(P->batches_total == b0 + 2, "(b) %llu batches harvested after the"
-      " pause, expected 2 (counted as work)",
-      (unsigned long long) (P->batches_total - b0));
+   CHECK(P->batches_total == b0 + (word64) P->nctx, "(b) %llu batches"
+      " harvested after the pause, expected %d (counted as work)",
+      (unsigned long long) (P->batches_total - b0), P->nctx);
    CHECK(P->bad_solves == bad0, "(b) %llu rejected solves",
       (unsigned long long) (P->bad_solves - bad0));
    rig_solve(1);
@@ -1785,12 +1851,11 @@ static void scenario_polling(void)
 }  /* end scenario_polling() */
 
 /**
- * Start a pipeline device and build its map (cached), expect pipeline
- * mode. @returns 0 on success
+ * Build the map (cached) of a device started by dev_start(), expect
+ * pipeline mode. @returns 0 on success
 */
-static int pipeline_start(const char *skip, const char *batch)
+static int pipeline_build(void)
 {
-   if (dev_start("0", skip, batch)) return (-1);
    if (!pipeline_mode()) {
       CHECK(0, "pipeline mode expected");
       return (-1);
@@ -1800,6 +1865,16 @@ static int pipeline_start(const char *skip, const char *batch)
    if (rig_build() < 0) return (-1);
    CHECK(pipeline_active(), "fell back to legacy: %s", LastAlert);
    return 0;
+}  /* end pipeline_build() */
+
+/**
+ * Start a pipeline device and build its map (cached), expect pipeline
+ * mode. @returns 0 on success
+*/
+static int pipeline_start(const char *skip, const char *batch)
+{
+   if (dev_start("0", skip, batch)) return (-1);
+   return pipeline_build();
 }  /* end pipeline_start() */
 
 /**
@@ -1831,7 +1906,7 @@ static void scenarios_pipeline(void)
    EMU_RT_KCFG *k;
    unsigned long alerts, nt, ns;
    word64 bad0;
-   word32 n0;
+   word32 n0, m;
    int i, n, avail;
 
    section("P2 pipeline: init, map + T build, self-test, solves");
@@ -1857,8 +1932,11 @@ static void scenarios_pipeline(void)
       return;
    }
    P = PCTX;
-   printf("   N = %u slots (min %u, cap %u)\n", (unsigned) P->nslots,
-      (unsigned) P->nslots_min, (unsigned) P->cap);
+   printf("   N = %u slots (min %u, cap %u) x %d contexts\n",
+      (unsigned) P->nslots, (unsigned) P->nslots_min, (unsigned) P->cap,
+      P->nctx);
+   CHECK(Streams != NULL || P->nctx == PEACH_CUDA_NCTX_AUTO, "%d batch"
+      " contexts (automatic), expected %d", P->nctx, PEACH_CUDA_NCTX_AUTO);
    R.pause = R.keep = 1;
    k = emu_rt_kcfg("kcu_peach_pipe_transitions", 1);
    nt = k->launches;
@@ -1881,8 +1959,26 @@ static void scenarios_pipeline(void)
    CHECK(R.dev.hps > 0, "ctx->hps = 0 after %llu batches",
       (unsigned long long) P->batches_total);
    CHECK(Bchk.batches > 0, "no pipeline batch launch was checked");
-   /* adaptive batch size: batches slower than 250 ms */
+   /* adaptive batch size, batches of two sizes in flight: two slow
+    * batches halve the size once; the batches of the old size still in
+    * flight after it, and the new ones they slow down (contend_batch()),
+    * must not halve it again (no solves: the contexts stay in step) */
+   rig_candidate(DIFF_NEVER);
+   n0 = P->nslots;
+   m = (n0 / 2) & ~((word32) PEACH_PIPE_BLOCK - 1);
+   if (m < P->nslots_min) m = P->nslots_min;
+   Fx.contend = n0;
+   for (i = 0; i < 40; i++) rig_poll();
+   Fx.contend = 0;
    k = emu_rt_kcfg("kcu_peach_pipe_final", 1);
+   k->ms = -1.0;
+   CHECK(n0 > P->nslots_min && P->nslots == m, "slow batches, then"
+      " batches slowed down by the old size in flight (%d contexts):"
+      " nslots %u -> %u, expected %u", P->nctx, (unsigned) n0,
+      (unsigned) P->nslots, (unsigned) m);
+   CHECK(pipeline_active(), "fallback: %s", LastAlert);
+   rig_candidate(DIFF_SOLVE);
+   /* adaptive batch size: batches slower than 250 ms */
    n0 = P->nslots;
    k->ms = 400.0;
    for (i = 0; i < 40; i++) rig_poll();
@@ -1911,9 +2007,16 @@ static void scenarios_pipeline(void)
     * hash at difficulty 0: batches run, every solve is verified */
    rig_candidate(0);
    bad0 = PCTX->bad_solves;
-   rig_solve(2);
-   CHECK(R.last.difficulty[0] == 0, "difficulty 0: last solve has"
-      " difficulty %u", (unsigned) R.last.difficulty[0]);
+   /* each batch context may still report one solve of the previous
+    * candidate (gpuminer's previous trailer), possibly after solves of
+    * the current one (a poll returns at its first solve, so the batches
+    * of the first contexts, which all solve now, are harvested first) */
+   for (i = 0; i < 4 * PCTX->nctx; i++) {
+      if (rig_solve(1) < 0 || R.last.difficulty[0] == 0) break;
+   }
+   CHECK(R.last.difficulty[0] == 0, "difficulty 0: no solve of the"
+      " difficulty 0 candidate (last solve has difficulty %u)",
+      (unsigned) R.last.difficulty[0]);
    CHECK(PCTX->bad_solves == bad0, "difficulty 0: %llu rejected solves",
       (unsigned long long) (PCTX->bad_solves - bad0));
    CHECK(Nlog[PLOG_ALERT] == alerts, "unexpected alert: %s", LastAlert);
@@ -2058,8 +2161,166 @@ static void scenarios_pipeline(void)
    if (pipeline_start("0x40,0x40,0,0x40,0x40,0x40,0x40,0x04", NULL) == 0) {
       CHECK(PCTX->cfg_skip[2] == 0 && PCTX->cfg_skip[7] == 0x04,
          "per-round MCM_PEACH_SKIP not applied");
+      CHECK(PCTX->cfg_skip_auto == 0, "explicit MCM_PEACH_SKIP is auto");
       rig_solve(2);
       dev_free();
+   }
+   /* default (automatic) skip masks per compute capability: 0x40 in
+    * every round (the fake device: 8.6), MD2 evaluated in rounds 4..7
+    * on 12.x; an explicit MCM_PEACH_SKIP wins */
+   {
+      static const struct {
+         int cc;
+         const char *skip;
+         word8 mask[8];
+         const char *log;
+      } sk[] = {
+         { 8, NULL, { 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40 },
+            "MCM_PEACH_SKIP=auto(cc 8: 0x40)" },
+         { 12, NULL, { 0x40, 0x40, 0x40, 0x40, 0, 0, 0, 0 },
+            "MCM_PEACH_SKIP=auto(cc 12: 0x40,0x40,0x40,0x40,0x00,0x00,"
+            "0x00,0x00)" },
+         { 12, "0x40", { 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40 },
+            "MCM_PEACH_SKIP=0x40 " },
+         { 12, "0", { 0, 0, 0, 0, 0, 0, 0, 0 }, "MCM_PEACH_SKIP=0x00 " }
+      };
+      const int cc = emu_rt.dev.cc_major;
+      int j;
+
+      for (i = 0; i < (int) (sizeof(sk) / sizeof(sk[0])); i++) {
+         emu_rt.dev.cc_major = sk[i].cc;
+         LastInfo[0] = '\0';
+         n = dev_start("0", sk[i].skip, NULL);
+         emu_rt.dev.cc_major = cc;
+         if (n != 0) continue;
+         /* the init log line names the masks in use */
+         CHECK(strstr(LastInfo, sk[i].log) != NULL, "cc %d, MCM_PEACH_SKIP="
+            "%s: init log line without \"%s\": %s", sk[i].cc,
+            sk[i].skip ? sk[i].skip : "<unset>", sk[i].log, LastInfo);
+         if (pipeline_build() != 0) continue;
+         P = PCTX;
+         for (j = 0; j < 8; j++) {
+            CHECK(P->cfg_skip[j] == sk[i].mask[j], "cc %d, MCM_PEACH_SKIP=%s:"
+               " cfg_skip[%d] = 0x%x, expected 0x%x", sk[i].cc,
+               sk[i].skip ? sk[i].skip : "<unset>", j,
+               (unsigned) P->cfg_skip[j], (unsigned) sk[i].mask[j]);
+         }
+         CHECK(P->cfg_skip_auto == (sk[i].skip == NULL), "cc %d,"
+            " MCM_PEACH_SKIP=%s: cfg_skip_auto %d", sk[i].cc,
+            sk[i].skip ? sk[i].skip : "<unset>", P->cfg_skip_auto);
+         rig_solve(2);
+         printf("   cc %d, MCM_PEACH_SKIP=%s: masks %02x %02x %02x %02x"
+            " %02x %02x %02x %02x\n", sk[i].cc,
+            sk[i].skip ? sk[i].skip : "<unset>", P->cfg_skip[0],
+            P->cfg_skip[1], P->cfg_skip[2], P->cfg_skip[3], P->cfg_skip[4],
+            P->cfg_skip[5], P->cfg_skip[6], P->cfg_skip[7]);
+         dev_free();
+      }
+   }
+   /* the init log line names the masks in use */
+   {
+      const int cc = emu_rt.dev.cc_major;
+
+      emu_rt.dev.cc_major = 12;
+      LastInfo[0] = '\0';
+      n = dev_start("0", NULL, NULL);
+      emu_rt.dev.cc_major = cc;
+      if (n == 0) {
+         CHECK(strstr(LastInfo, "MCM_PEACH_SKIP=auto(cc 12: 0x40,0x40,0x40,"
+            "0x40,0x00,0x00,0x00,0x00)") != NULL, "init log line: %s",
+            LastInfo);
+         dev_free();
+      }
+   }
+   /* MD2 grid: with several batch contexts at most
+    * PEACH_CUDA_MD2_BLOCKS resident blocks per SM, with one its
+    * occupancy; never more than its occupancy */
+   {
+      EMU_RT_KCFG *k = emu_rt_kcfg("kcu_peach_pipe_hash_md2", 1);
+      static const struct {
+         int occ;
+         const char *streams;    /* NULL: the scenarios' setting */
+      } md[] = {
+         { 6, NULL }, { PEACH_CUDA_MD2_BLOCKS, NULL }, { 3, NULL },
+         { 1, NULL }, { 6, "1" }, { 6, "2" }
+      };
+      const int keep_occ = k->active_sm;
+      const char *keep = Streams;
+      int want;
+
+      for (i = 0; i < (int) (sizeof(md) / sizeof(md[0])); i++) {
+         k->active_sm = md[i].occ;
+         if (md[i].streams != NULL) Streams = md[i].streams;
+         n = dev_start("0", NULL, NULL);
+         Streams = keep;
+         if (n == 0) {
+            P = PCTX;
+            CHECK(pipeline_mode(), "MD2 occupancy %d: no pipeline mode",
+               md[i].occ);
+            want = P->nctx > 1 && md[i].occ > PEACH_CUDA_MD2_BLOCKS ?
+               PEACH_CUDA_MD2_BLOCKS : md[i].occ;
+            CHECK(P->launch.grid_hash[6] == P->sms * want, "MD2 occupancy"
+               " %d, %d contexts: grid %d, expected %d x %d SMs",
+               md[i].occ, P->nctx, P->launch.grid_hash[6], want, P->sms);
+            CHECK(md[i].streams == NULL ||
+               P->nctx == atoi(md[i].streams), "MCM_PEACH_STREAMS=%s:"
+               " %d contexts", md[i].streams, P->nctx);
+            CHECK(P->launch.grid_hash[0] == P->sms * keep_occ,
+               "MD2 occupancy %d: blake2b grid %d", md[i].occ,
+               P->launch.grid_hash[0]);
+            dev_free();
+         }
+      }
+      k->active_sm = keep_occ;
+      printf("   MD2 grid: min(occupancy, %d) blocks per SM with several"
+         " contexts, its occupancy with one\n", PEACH_CUDA_MD2_BLOCKS);
+   }
+   /* batch contexts: 1, 2, 3 with full evaluation (MD2 kernel), 4, then
+    * invalid values (automatic) */
+   {
+      static const struct {
+         const char *streams, *skip;
+         int nctx;
+      } sc[] = {
+         { "1", NULL, 1 }, { "2", NULL, 2 }, { "3", "0", 3 },
+         { "4", NULL, 4 }, { "5", NULL, PEACH_CUDA_NCTX_AUTO },
+         { "two", NULL, PEACH_CUDA_NCTX_AUTO }
+      };
+      const char *keep = Streams;
+      word64 b0;
+
+      for (i = 0; i < (int) (sizeof(sc) / sizeof(sc[0])); i++) {
+         Streams = sc[i].streams;
+         n = pipeline_start(sc[i].skip, NULL);
+         Streams = keep;
+         if (n != 0) continue;
+         P = PCTX;
+         CHECK(P->nctx == sc[i].nctx, "MCM_PEACH_STREAMS=%s: %d contexts,"
+            " expected %d", sc[i].streams, P->nctx, sc[i].nctx);
+         /* (every kernel has the same occupancy on the fake device, not
+          * above PEACH_CUDA_MD2_BLOCKS: the MD2 grid is the same with any
+          * number of contexts) */
+         CHECK(P->launch.grid_hash[6] == P->launch.grid_hash[0],
+            "MCM_PEACH_STREAMS=%s: MD2 grid %d, other hash grids %d",
+            sc[i].streams, P->launch.grid_hash[6], P->launch.grid_hash[0]);
+         /* slots per batch do not depend on the contexts (the fake
+          * device fits full batches for any number of them) */
+         CHECK(P->cap == (word32) PEACH_CUDA_SLOTS_PER_THREAD *
+            (word32) P->sms * (word32) P->max_threads_sm,
+            "MCM_PEACH_STREAMS=%s: %u slots per batch, expected %d x %d"
+            " SMs x %d threads", sc[i].streams, (unsigned) P->cap,
+            PEACH_CUDA_SLOTS_PER_THREAD, P->sms, P->max_threads_sm);
+         b0 = P->batches_total;
+         n = rig_until(pred_inflight, 40);
+         CHECK(n >= 0, "MCM_PEACH_STREAMS=%s: not every batch context has"
+            " a batch in flight", sc[i].streams);
+         rig_solve(2);
+         printf("   MCM_PEACH_STREAMS=%s: %d contexts, md2 grid %d (of"
+            " %d), +%llu batches\n", sc[i].streams, P->nctx,
+            P->launch.grid_hash[6], P->launch.grid_hash[0],
+            (unsigned long long) (P->batches_total - b0));
+         dev_free();
+      }
    }
    section_end(NULL);
 
@@ -2106,6 +2367,8 @@ int main(void)
    if (only != NULL && strcmp(only, "legacy") != 0 &&
          strcmp(only, "pipeline") != 0) only = NULL;
    Ncache = (int) env_long("PEACH_TEST_HOST_CACHE", MAXCACHE, 0, MAXCACHE);
+   Streams = getenv("PEACH_TEST_HOST_STREAMS");
+   if (Streams != NULL && *Streams == '\0') Streams = NULL;
    srand16(1, 2, 3);
    srand32(4);
 

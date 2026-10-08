@@ -11,7 +11,7 @@
 # src/peach.cu compiled by ptxas for sm_<sm>, as the driver JIT does when
 # a binary without sm_<sm> code runs on such a GPU; a build without
 # -arch, like `make all`, ships sm_52 code and compute_52 PTX only).
-# Default targets: 52 61 75 86 89 90 120 52:86 52:120.
+# Default targets: 52 61 75 86 89 90 100 120 52:86 52:120.
 # Each target is compiled with ptxas verbose output, and every
 # kcu_peach_pipe_* kernel is checked: a non-zero stack frame, spill store
 # or spill load fails the gate. Other kernels (the official kcu_peach_*
@@ -35,7 +35,7 @@ NVCC=${NVCC:-$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)}
 MIN=${PEACH_GATE_MIN_KERNELS:-0}
 ARCHS=("$@")
 if [ ${#ARCHS[@]} -eq 0 ]; then
-   ARCHS=(52 61 75 86 89 90 120 52:86 52:120)
+   ARCHS=(52 61 75 86 89 90 100 120 52:86 52:120)
 fi
 PTXAS=${PTXAS:-$(dirname "$(command -v "$NVCC" || echo "$NVCC")")/ptxas}
 if [ ! -x "$PTXAS" ]; then PTXAS=$(command -v ptxas || echo ptxas); fi
