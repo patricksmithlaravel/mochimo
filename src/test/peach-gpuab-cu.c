@@ -390,15 +390,20 @@ int main(void)
       if (rate[i] < 0.0) fails++;
    }
 
-   printf("== summary (completed nonces/s, speedup vs %s)\n", Config[0].name);
+   /* speedup only against a measured baseline (not run with
+    * PEACH_GPUAB_ONLY=<other label>) */
+   if (rate[0] > 0.0) {
+      printf("== summary (completed nonces/s, speedup vs %s)\n",
+         Config[0].name);
+   } else printf("== summary (completed nonces/s)\n");
    for (i = 0; i < NCONFIG; i++) {
       if (only != NULL ? strcmp(only, Config[i].name) != 0 :
             (Config[i].sweep && !sweep)) continue;
       if (rate[i] < 0.0) printf("   %-28s FAILED\n", Config[i].name);
-      else {
+      else if (rate[0] > 0.0) {
          printf("   %-28s %10.3f M/s  x%.2f\n", Config[i].name,
-            rate[i] / 1e6, rate[0] > 0.0 ? rate[i] / rate[0] : 0.0);
-      }
+            rate[i] / 1e6, rate[i] / rate[0]);
+      } else printf("   %-28s %10.3f M/s\n", Config[i].name, rate[i] / 1e6);
    }
 
    return fails ? EXIT_FAILURE : EXIT_SUCCESS;

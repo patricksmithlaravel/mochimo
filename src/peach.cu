@@ -63,12 +63,13 @@
    Large batches fill the tile ordered queues densely, so that jumps to
    neighbouring tiles share cache lines */
 #define PEACH_CUDA_MD2_BLOCKS       4  /**< max. resident blocks per SM of
-   the MD2 hash kernel (fewer than its occupancy allows, see
-   peach_cuda_pipeline_setup()) */
+   the MD2 hash kernel with several batch contexts (fewer than its
+   occupancy allows, see peach_cuda_pipeline_setup()) */
 #define PEACH_CUDA_MEM_PERCENT      80 /**< max. share of free memory used
    by the batch contexts, in percent */
 #define PEACH_CUDA_BATCH_MAX        WORD32_C(0x1000000)  /**< hard upper
-   bound of slots per batch (keeps 17 x N queue indices in 32 bits) */
+   bound of slots per batch (PEACH_PIPE_MAXCAP: keeps the offsets of the
+   8 round 0 queues, 8 x N slot numbers, in 32 bits) */
 #define PEACH_CUDA_T_BYTES   (sizeof(word16) * PEACHCACHELEN)  /**< T */
 
 /* Pipeline solver safety and tuning */
@@ -193,6 +194,10 @@ typedef struct {
    word32 epoch_inflight[PEACH_CUDA_NCTX_MAX];  /**< epoch of the
                                           in-flight batch */
    int inflight[PEACH_CUDA_NCTX_MAX];  /**< batch launched, unharvested */
+   int timed[PEACH_CUDA_NCTX_MAX];     /**< batch launched while every
+                                          other batch in flight had its
+                                          slots: its time counts for the
+                                          adaptive batch size */
    /* pipeline: counters */
    word64 batches;                     /**< batches since last DEV_INIT */
    word64 batches_total;               /**< batches since init */
@@ -1578,11 +1583,16 @@ static int peach_cuda_pipeline_setup(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
    }
    /* MD2 is bound by the rate of shared memory loads and a hash takes
     * about 1 ms per thread, the other hash kernels are bound by memory:
-    * fewer resident MD2 blocks per SM than its occupancy leave room on
-    * every SM for the kernels of the other batch contexts (RTX 5090,
-    * full evaluation: 4 instead of 5 blocks per SM gave +8% completed
-    * nonces/s; 2 or 3 blocks were slower) */
-   if (nb[6] > PEACH_CUDA_MD2_BLOCKS) nb[6] = PEACH_CUDA_MD2_BLOCKS;
+    * with several batch contexts, fewer resident MD2 blocks per SM than
+    * its occupancy leave room on every SM for the kernels of the other
+    * contexts (RTX 5090, full evaluation: 4 instead of 5 blocks per SM
+    * gave +8% completed nonces/s; 2 or 3 blocks were slower). A single
+    * context has no other kernels to fill that room: MD2 keeps its
+    * occupancy (RTX 5090, MCM_PEACH_STREAMS=1: 4 blocks per SM were
+    * 5-8% slower than 5) */
+   if (P->nctx > 1 && nb[6] > PEACH_CUDA_MD2_BLOCKS) {
+      nb[6] = PEACH_CUDA_MD2_BLOCKS;
+   }
    P->launch.block = PEACH_PIPE_BLOCK;
    for (i = 0; i < 8; i++) P->launch.grid_hash[i] = peach_cuda_grid(P, nb[i]);
    P->launch.grid_init = peach_cuda_grid(P, nb[8]);
@@ -2274,8 +2284,10 @@ static int peach_cuda_selftest(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P,
  * a row slower than PEACH_CUDA_BATCH_MS halve the slots of later batches
  * (not below nslots_min), and PEACH_CUDA_BATCH_GROW fast batches in a row
  * double them again (up to cap), counting only batches launched with the
- * current slots (with several contexts, batches launched before a change
- * are still in flight after it); the canary (final queue entry 0) is
+ * current slots while every other batch in flight had them too
+ * (P->timed[id]: with several contexts, batches launched before a change
+ * are still in flight after it, and they slow down the batches next to
+ * them); the canary (one final queue entry, see peach_pipe_canary()) is
  * verified on the CPU for the first PEACH_CUDA_CANARY_FIRST batches after
  * a map build, then every PEACH_CUDA_CANARY_EVERY-th batch; a solve is
  * composed from the batch's own trailer snapshot h_bt[id] (incl. its
@@ -2325,9 +2337,12 @@ static int peach_cuda_harvest(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
     * (a single outlier is ignored); a run of batches fast enough to stay
     * well below the limit when doubled (2/5 of it) doubles them again, up
     * to the capacity. A batch launched with other slots than the current
-    * ones (before a change) does not count */
-   if (P->params[id].nslots != P->nslots) {
-      /* launched before the last change: says nothing about it */
+    * ones (before a change), or while a batch with other slots was in
+    * flight (which shares the GPU with it and slows it down), does not
+    * count */
+   if (P->params[id].nslots != P->nslots || !P->timed[id]) {
+      /* launched before the last change, or timed with batches of
+       * another size on the GPU: says nothing about the current size */
    } else if (cudaEventElapsedTime(&ms, P->ev_start[id], P->ev_stop[id]) !=
          cudaSuccess) {
       (void) cudaGetLastError();  /* no timing: keep the batch size */
@@ -2358,7 +2373,7 @@ static int peach_cuda_harvest(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
       }
    }
 
-   /* canary: final queue entry 0 vs the CPU reference */
+   /* canary (a final queue entry, peach_pipe_canary()) vs the CPU */
    if (res.canary_valid && (P->batches <= PEACH_CUDA_CANARY_FIRST ||
          (P->batches % PEACH_CUDA_CANARY_EVERY) == 0)) {
       P->canary_checks++;
@@ -2419,7 +2434,7 @@ static int peach_cuda_launch(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
    PEACH_PIPE_PARAMS *p;
    SHA256_CTX sctx;
    word32 nlo[4], q;
-   int draws, nanf, rc;
+   int draws, nanf, rc, i;
    cudaError_t err;
 
 #undef cuCHK
@@ -2492,6 +2507,16 @@ static int peach_cuda_launch(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
    cuCHK(cudaEventRecord(P->ev_stop[id], P->stream[id]));
    P->epoch_inflight[id] = p->epoch;
    P->inflight[id] = 1;
+   /* its time counts only if every other batch in flight has its slots
+    * (no batch of another size can start while it runs: P->nslots
+    * changes only at a harvest, after which this batch no longer has
+    * the current size) */
+   P->timed[id] = 1;
+   for (i = 0; i < P->nctx; i++) {
+      if (i != id && P->inflight[i] && P->params[i].nslots != p->nslots) {
+         P->timed[id] = 0;
+      }
+   }
 
    return 0;
 }  /* end peach_cuda_launch() */

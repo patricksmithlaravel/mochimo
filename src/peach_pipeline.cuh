@@ -4,12 +4,15 @@
  * @details Compiles as CUDA C++ under nvcc (included by peach.cu) and as
  * plain C under gcc (included by CPU tests after test/_cuda_emu.h).
  * <br />
- * A batch of N nonce slots is processed as: init (thread per slot) ->
- * for round r = 0..7: one hash kernel per algorithm not skipped in that
- * round, consuming the per-algorithm queue of round r and appending to
- * the queues of round r + 1 -> final (sha256 with the last tile and the
- * difficulty check). The per-jump algorithm selection is described in
- * peach_select.h.
+ * A batch of N nonce slots is processed as: init (thread per slot,
+ * appends to the round 0 queues) -> for round r = 0..7: one hash kernel
+ * per algorithm not skipped in that round, consuming the per-algorithm
+ * queue of round r and storing each surviving slot's sort key and tile
+ * histogram count for round r + 1, then a scan and a scatter kernel that
+ * build the tile ordered queues of round r + 1 (round 7: the final
+ * queue) -> final (sha256 with the last tile and the difficulty check).
+ * See PIPELINE KERNELS below for the queue layout. The per-jump
+ * algorithm selection is described in peach_select.h.
  * <br />
  * The legacy nonce frame tables, cuCONSTn860 and cu_rand64() also live
  * here (shared with the legacy kcu_peach_solve() in peach.cu); their
@@ -186,7 +189,8 @@ typedef struct {
    word64 completed;          /**< nonces that reached the final hash */
    word32 nonce_hi[4];        /**< solving nonce words 4..7 */
    word32 hash[8];            /**< solving final hash */
-   word32 canary_valid;       /**< canary written (final queue entry 0) */
+   word32 canary_valid;       /**< canary written (final queue entry
+                                 peach_pipe_canary()) */
    word32 canary_nonce_hi[4]; /**< canary nonce words 4..7 */
    word32 canary_hash[8];     /**< canary final hash */
    word32 overflow;           /**< queue overflows (must stay 0) */
@@ -605,6 +609,24 @@ PEACH_HD word32 peach_pipe_qlen(word32 cnt, word32 off, word32 cap)
 
 /**
  * @private
+ * Final queue entry whose nonce is the canary of a batch: a position
+ * that moves from batch to batch (a Weyl sequence of the epoch, scaled
+ * to @a n). The final queue is in tile order, so a fixed entry (such as
+ * entry 0) would always have a final tile from the lowest bucket; this
+ * one has a final tile anywhere in the map.
+ * @param epoch Batch epoch
+ * @param n Final queue length (stored entries)
+ * @returns entry index, below @a n (0 if @a n is 0)
+*/
+PEACH_HD word32 peach_pipe_canary(word32 epoch, word32 n)
+{
+   const word32 u = epoch * WORD32_C(0x9E3779B1);
+
+   return (word32) (((word64) u * (word64) n) >> 32);
+}  /* end peach_pipe_canary() */
+
+/**
+ * @private
  * Nighthash of a jump seed view with algorithm @a algo (a constant at
  * every call site, so only one hash survives inlining).
  * @param algo Algorithm 0..7 (peach_nighthash() numbering)
@@ -634,10 +656,12 @@ PEACH_DEV void peach_pipe_hash(word32 algo, const word32 *n, word32 m,
  * Body of the hash kernel of algorithm @a algo in round @a round: for
  * each entry of queue (round, algo), hash the slot's jump seed view,
  * select the next algorithm (rounds 0..6) and, unless that round's skip
- * mask drops the slot, store its key (next queue, tile and P & 7) and
+ * mask drops the slot, store its key (next queue << 20 | next tile) and
  * count it in the tile histogram of that queue; round 7 does so for the
  * final queue. A dropped slot gets the key PEACH_PIPE_KEYDEAD.
- * kcu_peach_pipe_scatter() then builds the queues of round + 1.
+ * kcu_peach_pipe_scatter() then builds the queues of round + 1: each
+ * entry is the slot's round 0 state (d_slot, which keeps P & 7) with the
+ * tile of the key.
  * @param p Batch parameters
  * @param b Batch buffers
  * @param round Round number, 0..7
@@ -754,11 +778,11 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
  * nonce words 4..7 (official GPU frame) from the slot's RNG state,
  * hash0 = sha256(bt[0..123]) from the midstate, mario0 = product of the
  * hash0 bytes & 0xFFFFF, P = op after the nonce (from p.q over words
- * 4..7), algo0 = select(P, T[mario0]); append the slot to q[0][algo0]
- * unless skip mask 0 drops it. A NaN replacement in words 4..7 (never
- * expected) drops the slot and counts in the result's anomaly. Sets the
- * key of every slot to PEACH_PIPE_KEYDEAD (round 0 sets the keys of the
- * slots it processes).
+ * 4..7), algo0 = select(P, T[mario0]); append the slot to the round 0
+ * queue q[algo0] (d_q + algo0 * cap) unless skip mask 0 drops it. A NaN
+ * replacement in words 4..7 (never expected) drops the slot and counts
+ * in the result's anomaly. Sets the key of every slot to
+ * PEACH_PIPE_KEYDEAD (round 0 sets the keys of the slots it processes).
  * Requires d_cnt and d_res zeroed (peach_pipe_enqueue()).
  * @param p Batch parameters
  * @param b Batch buffers
@@ -851,12 +875,36 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
       peach_pipe_round(p, b, round, (ALGO), NULL); \
    }
 
-/* launch bounds of the hash kernels: SHA3/Keccak with at least 4
- * resident blocks per SM (<= 128 registers, no spills): with the
- * PEACH_LDGTILE() loads, sm_120 ptxas otherwise allocates 162 registers
- * (3 blocks per SM, slower) */
+/* launch bounds of the hash kernels. SHA3/Keccak are close to 128
+ * registers per thread, and the bound that ptxas meets without spills
+ * depends on the architecture and on the CUDA version (checked with
+ * CUDA 12.8 and 12.9; the ptxas gate checks the version CI uses):
+ * - sm_120: 4 blocks per SM with CUDA 12.8 (122 registers; on an RTX
+ *   5090 about 3% faster with the default skip masks than 3 blocks);
+ *   with CUDA 12.9 a 4-block bound, or none, spills, so 3 blocks (162
+ *   registers);
+ * - sm_100 and sm_101: 3 blocks per SM with CUDA 12.8 (168 registers);
+ *   with CUDA 12.9 that bound spills, so none (138 registers, also 3
+ *   blocks per SM);
+ * - older targets: 4 blocks per SM (115-122 registers with or without
+ *   it), as a guard.
+ * Host code launches these kernels with PEACH_PIPE_BLOCK threads only. */
 #define PEACH_PIPE_LB_DEFAULT  __launch_bounds__(PEACH_PIPE_BLOCK)
-#define PEACH_PIPE_LB_KECCAK   __launch_bounds__(PEACH_PIPE_BLOCK, 4)
+#if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 12 || \
+      (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9))
+   #define PEACH_PIPE_NVCC129  1   /* CUDA 12.9 or newer */
+#else
+   #define PEACH_PIPE_NVCC129  0
+#endif
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && \
+      __CUDA_ARCH__ < 1200 && PEACH_PIPE_NVCC129
+   #define PEACH_PIPE_LB_KECCAK   __launch_bounds__(PEACH_PIPE_BLOCK)
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && \
+      (__CUDA_ARCH__ < 1200 || PEACH_PIPE_NVCC129)
+   #define PEACH_PIPE_LB_KECCAK   __launch_bounds__(PEACH_PIPE_BLOCK, 3)
+#else
+   #define PEACH_PIPE_LB_KECCAK   __launch_bounds__(PEACH_PIPE_BLOCK, 4)
+#endif
 
 /** CUDA hash kernel, algo 0: Blake2b-256 keyed with 32 zero bytes. */
 PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_blake2b32, 0,
@@ -1037,9 +1085,10 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
 /**
  * CUDA kernel finishing a batch: for each final queue entry, final =
  * sha256(hash0 || tile[mario]); counts completed nonces (per warp);
- * entry 0 writes the canary (nonce words 4..7 and final hash); the first
- * entry meeting p.diff wins atomicCAS(found, 0, 1) and writes its nonce
- * words 4..7 and final hash. Writes the batch epoch to the result.
+ * entry peach_pipe_canary(p.epoch, n) of the n stored entries writes the
+ * canary (nonce words 4..7 and final hash); the first entry meeting
+ * p.diff wins atomicCAS(found, 0, 1) and writes its nonce words 4..7 and
+ * final hash. Writes the batch epoch to the result.
  * @param p Batch parameters
  * @param b Batch buffers
 */
@@ -1047,13 +1096,14 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
    kcu_peach_pipe_final(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b)
 {
    PEACH_PIPE_RESULT *res = b.d_res;
-   word32 h0[8], out[8], n4[4], n, base, k, slot, m;
+   word32 h0[8], out[8], n4[4], n, base, k, slot, m, canary;
    uint4 v, w, nv;
    int valid, i;
 
    if (blockIdx.x == 0 && threadIdx.x == 0) res->epoch = p.epoch;
    n = peach_pipe_qlen(PEACH_LDG32(&b.d_cnt[PEACH_PIPE_FINALCNT *
       PEACH_PIPE_CNTPAD]), 0, b.cap);
+   canary = peach_pipe_canary(p.epoch, n);
    for (base = blockIdx.x * blockDim.x; base < n;
          base += gridDim.x * blockDim.x) {
       k = base + threadIdx.x;
@@ -1075,8 +1125,8 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
             PEACH_PIPE_UNROLL
             for (i = 0; i < 8; i++) b.d_trace[slot].final[i] = out[i];
          }
-         /* canary: final queue entry 0 */
-         if (k == 0) {
+         /* canary: one final queue entry, moving from batch to batch */
+         if (k == canary) {
             res->canary_nonce_hi[0] = nv.x;
             res->canary_nonce_hi[1] = nv.y;
             res->canary_nonce_hi[2] = nv.z;

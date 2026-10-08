@@ -601,11 +601,11 @@ static word64 check_batch(const CFG *c, const REFSLOT *R, int count,
          R[k].mario[PEACHROUNDS] : PEACH_PIPE_KEYDEAD;
       if (Bufs.d_key[k] != e) fail(c->name, k, "slot key");
    }
-   /* canary: final queue entry 0 */
+   /* canary: final queue entry peach_pipe_canary() */
    if (alive == 0) {
       if (res->canary_valid != 0) fail(c->name, -1, "canary without entry");
    } else {
-      slot = Bufs.d_ent[0].id;
+      slot = Bufs.d_ent[peach_pipe_canary(epoch, cnt < cap ? cnt : cap)].id;
       if (res->canary_valid != 1 || slot >= (word32) count ||
             !words_eq(res->canary_nonce_hi, &R[slot].nonce[4], 4) ||
             !words_eq(res->canary_hash, R[slot].final, 8)) {
@@ -660,7 +660,7 @@ static void check_helpers(void)
    PEACH_PIPE_LAUNCH l;
    PEACH_PIPE_BUFS b;
    word32 h[8], w, op, x, buf[2], tile[PEACHTILELEN32], list[20];
-   word32 fr[4], fr2[4];
+   word32 fr[4], fr2[4], quarter[4];
    word64 fails0 = Fails, sum0, sum1, sd;
    word8 masks[8], *hb = (word8 *) h;
    word16 tt;
@@ -702,6 +702,22 @@ static void check_helpers(void)
          if (peach_pipe_skip_mask(peach_pipe_skip_pack(masks), (word32) j)
                != masks[j]) fail("skip pack/mask", j, "");
       }
+   }
+   /* canary entry: below the queue length, and spread over the (tile
+    * ordered) final queue from one epoch to the next */
+   if (peach_pipe_canary(1, 0) != 0 || peach_pipe_canary(~0u, 1) != 0) {
+      fail("peach_pipe_canary()", -1, "empty or single entry queue");
+   }
+   memset(quarter, 0, sizeof(quarter));
+   for (i = 0; i < 64; i++) {
+      x = peach_pipe_canary((word32) i + 1, 4096);
+      if (x >= 4096) fail("peach_pipe_canary()", i, "out of range");
+      else quarter[x / 1024]++;
+      x = peach_pipe_canary(r32(), (word32) (i + 1));
+      if (x > (word32) i) fail("peach_pipe_canary()", i, "out of range");
+   }
+   for (i = 0; i < 4; i++) {
+      if (quarter[i] < 8) fail("peach_pipe_canary()", i, "quarter missed");
    }
    /* enqueue argument validation: nothing is enqueued */
    memset(&p, 0, sizeof(p));

@@ -33,7 +33,7 @@ jobs:
         run: >-
           make -k test-peach-select test-peach-hash test-peach-pipeline
           test-peach-vectors NO_CUDA=1
-      - name: Peach CUDA host code on a fake CUDA runtime (about 1 min, 3 GiB)
+      - name: Peach CUDA host code on a fake CUDA runtime (minutes, 3 GiB)
         if: always()
         env:
           PEACH_TEST_HOST: 1
@@ -69,9 +69,9 @@ jobs:
         run: make build/test/peach-gpuab-cu build/test/peach-host
       - name: ptxas gate (kcu_peach_pipe_* kernels, no stack frame or spills)
         env:
-          PEACH_GATE_MIN_KERNELS: 12
+          PEACH_GATE_MIN_KERNELS: 14
         # 52: the default build (sm_52 SASS + compute_52 PTX); 52:86 and
         # 52:120: that PTX compiled for newer GPUs, as the driver does
         run: >-
-          .github/scripts/peach-ptxas-gate.sh 52 61 75 86 89 90 120
+          .github/scripts/peach-ptxas-gate.sh 52 61 75 86 89 90 100 120
           52:86 52:120
