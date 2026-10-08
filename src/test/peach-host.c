@@ -47,7 +47,9 @@
  * (7) peach_free_cuda_device() + re-initialization with another
  *     configuration; no leaks, double frees or invalid handles; the
  *     automatic skip masks per compute capability (8.x, 12.x) and
- *     explicit masks, with their names in the init log line; the MD2
+ *     explicit masks, with their names in the init log line, and the
+ *     slots per batch they lead to (doubled when the round 0 mask drops
+ *     an algorithm of every pair a, a + 4); the MD2
  *     grid (at most PEACH_CUDA_MD2_BLOCKS blocks per SM with several
  *     batch contexts, its occupancy with one); MCM_PEACH_STREAMS = 1 to 4
  *     and invalid values (automatic);
@@ -2167,22 +2169,36 @@ static void scenarios_pipeline(void)
    }
    /* default (automatic) skip masks per compute capability: 0x40 in
     * every round (the fake device: 8.6), MD2 evaluated in rounds 4..7
-    * on 12.x; an explicit MCM_PEACH_SKIP wins */
+    * and SHA-256, SHA3, Keccak dropped in round 0 on 12.x; an explicit
+    * MCM_PEACH_SKIP wins. Slots per batch: twice the default per thread
+    * when the round 0 mask drops an algorithm of every pair (a, a + 4) */
    {
       static const struct {
          int cc;
          const char *skip;
          word8 mask[8];
          const char *log;
+         word32 slots;     /* slots per batch per resident thread */
       } sk[] = {
          { 8, NULL, { 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40 },
-            "MCM_PEACH_SKIP=auto(cc 8: 0x40)" },
-         { 12, NULL, { 0x40, 0x40, 0x40, 0x40, 0, 0, 0, 0 },
-            "MCM_PEACH_SKIP=auto(cc 12: 0x40,0x40,0x40,0x40,0x00,0x00,"
-            "0x00,0x00)" },
+            "MCM_PEACH_SKIP=auto(cc 8: 0x40)", PEACH_CUDA_SLOTS_PER_THREAD },
+         { 12, NULL, { 0x78, 0x40, 0x40, 0x40, 0, 0, 0, 0 },
+            "MCM_PEACH_SKIP=auto(cc 12: 0x78,0x40,0x40,0x40,0x00,0x00,"
+            "0x00,0x00)", 2 * PEACH_CUDA_SLOTS_PER_THREAD },
          { 12, "0x40", { 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40 },
-            "MCM_PEACH_SKIP=0x40 " },
-         { 12, "0", { 0, 0, 0, 0, 0, 0, 0, 0 }, "MCM_PEACH_SKIP=0x00 " }
+            "MCM_PEACH_SKIP=0x40 ", PEACH_CUDA_SLOTS_PER_THREAD },
+         { 12, "0", { 0, 0, 0, 0, 0, 0, 0, 0 }, "MCM_PEACH_SKIP=0x00 ",
+            PEACH_CUDA_SLOTS_PER_THREAD },
+         { 8, "0x78,0x40,0x40,0x40,0,0,0,0",
+            { 0x78, 0x40, 0x40, 0x40, 0, 0, 0, 0 },
+            "MCM_PEACH_SKIP=0x78,0x40,0x40,0x40,0x00,0x00,0x00,0x00 ",
+            2 * PEACH_CUDA_SLOTS_PER_THREAD },
+         { 12, "0x70,0x40,0x40,0x40,0,0,0,0",
+            { 0x70, 0x40, 0x40, 0x40, 0, 0, 0, 0 },
+            "MCM_PEACH_SKIP=0x70,0x40,0x40,0x40,0x00,0x00,0x00,0x00 ",
+            PEACH_CUDA_SLOTS_PER_THREAD },
+         { 8, "0x87", { 0x87, 0x87, 0x87, 0x87, 0x87, 0x87, 0x87, 0x87 },
+            "MCM_PEACH_SKIP=0x87 ", 2 * PEACH_CUDA_SLOTS_PER_THREAD }
       };
       const int cc = emu_rt.dev.cc_major;
       int j;
@@ -2208,12 +2224,21 @@ static void scenarios_pipeline(void)
          CHECK(P->cfg_skip_auto == (sk[i].skip == NULL), "cc %d,"
             " MCM_PEACH_SKIP=%s: cfg_skip_auto %d", sk[i].cc,
             sk[i].skip ? sk[i].skip : "<unset>", P->cfg_skip_auto);
+         /* (the fake device fits full batches) */
+         CHECK(P->cap == sk[i].slots * (word32) P->sms *
+            (word32) P->max_threads_sm && P->nslots == P->cap, "cc %d,"
+            " MCM_PEACH_SKIP=%s: %u slots per batch (cap %u), expected"
+            " %u x %d SMs x %d threads", sk[i].cc,
+            sk[i].skip ? sk[i].skip : "<unset>", (unsigned) P->nslots,
+            (unsigned) P->cap, (unsigned) sk[i].slots, P->sms,
+            P->max_threads_sm);
          rig_solve(2);
          printf("   cc %d, MCM_PEACH_SKIP=%s: masks %02x %02x %02x %02x"
-            " %02x %02x %02x %02x\n", sk[i].cc,
+            " %02x %02x %02x %02x, %u slots per batch\n", sk[i].cc,
             sk[i].skip ? sk[i].skip : "<unset>", P->cfg_skip[0],
             P->cfg_skip[1], P->cfg_skip[2], P->cfg_skip[3], P->cfg_skip[4],
-            P->cfg_skip[5], P->cfg_skip[6], P->cfg_skip[7]);
+            P->cfg_skip[5], P->cfg_skip[6], P->cfg_skip[7],
+            (unsigned) P->cap);
          dev_free();
       }
    }
@@ -2226,7 +2251,7 @@ static void scenarios_pipeline(void)
       n = dev_start("0", NULL, NULL);
       emu_rt.dev.cc_major = cc;
       if (n == 0) {
-         CHECK(strstr(LastInfo, "MCM_PEACH_SKIP=auto(cc 12: 0x40,0x40,0x40,"
+         CHECK(strstr(LastInfo, "MCM_PEACH_SKIP=auto(cc 12: 0x78,0x40,0x40,"
             "0x40,0x00,0x00,0x00,0x00)") != NULL, "init log line: %s",
             LastInfo);
          dev_free();

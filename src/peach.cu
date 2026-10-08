@@ -59,9 +59,10 @@
    context: slot state 16 + queue entry 16 + hash0 32 + rng 8 + key 4 +
    8 round 0 queues x 4 = 108 */
 #define PEACH_CUDA_SLOTS_PER_THREAD 32 /**< default slots per batch (each
-   batch context) per resident thread: N = 32 x SMs x maxThreadsPerSM.
-   Large batches fill the tile ordered queues densely, so that jumps to
-   neighbouring tiles share cache lines */
+   batch context) per resident thread: N = 32 x SMs x maxThreadsPerSM,
+   twice that when the round 0 skip mask drops about half of the nonces
+   (see peach_cuda_half0()). Large batches fill the tile ordered queues
+   densely, so that jumps to neighbouring tiles share cache lines */
 #define PEACH_CUDA_MD2_BLOCKS       4  /**< max. resident blocks per SM of
    the MD2 hash kernel with several batch contexts (fewer than its
    occupancy allows, see peach_cuda_pipeline_setup()) */
@@ -107,6 +108,10 @@
    peach_cuda_skip_default()); measured on sm_120 (RTX 5090) only */
 #define PEACH_CUDA_SKIP_LATE_ROUND  4    /**< first round of the late-MD2
    default skip masks that keeps MD2 jumps (rounds 0..3 drop them) */
+#define PEACH_CUDA_SKIP_LATE_R0     0x78 /**< round 0 mask of the late-MD2
+   default skip masks: drops SHA-256, SHA3, Keccak and MD2 (algorithms
+   3..6), the costlier algorithm of every pair (a, a + 4) that a tile
+   selects from (see peach_cuda_half0()) */
 
 /* Block trailer snapshot attempts (see peach_cuda_snapshot()) */
 #define PEACH_CUDA_SNAPSHOT_TRIES   64
@@ -1233,8 +1238,10 @@ static void peach_cuda_config(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
  * CUDA device, used when MCM_PEACH_SKIP is unset (or invalid): on
  * devices of compute capability PEACH_CUDA_SKIP_LATE_CC.x, MD2 jumps are
  * dropped in rounds 0..PEACH_CUDA_SKIP_LATE_ROUND - 1 and evaluated in
- * the later rounds (masks 0x40 x 4, then 0x00 x 4); on every other
- * device (not measured), MD2 jumps are dropped in every round (0x40 x 8).
+ * the later rounds, and round 0 also drops SHA-256, SHA3 and Keccak
+ * jumps (masks PEACH_CUDA_SKIP_LATE_R0, 0x40 x 3, then 0x00 x 4); on
+ * every other device (not measured), MD2 jumps are dropped in every
+ * round (0x40 x 8).
  * <br />
  * An MD2 jump costs several other jumps, and dropping a nonce loses the
  * jumps already spent on it. Early in its walk a nonce has cost little
@@ -1245,6 +1252,14 @@ static void peach_cuda_config(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
  * with MD2 there). Measured on an RTX 5090 (sm_120) with the GPU A/B
  * test: 79 M completed nonces/s with 0x40 x 4, 0x00 x 4, against 69 with
  * 0x40 in every round and 73 with full evaluation (0x00).
+ * <br />
+ * In round 0, the same holds for the costlier algorithm of the pair of
+ * tile 0 (peach_cuda_half0()): dropping SHA-256, SHA3 and Keccak there
+ * as well keeps the cheaper half of the nonces on every map, and twice
+ * the slots per batch keep the queues of rounds 1..7 as dense, at the
+ * same batch time (RTX 5090, 3 contexts: +3.4% on the block 1 map, and
+ * +2.8% to +3.2% on three maps with other tile 0 pairs, against 0x40 x 4,
+ * 0x00 x 4 with 32 slots per thread).
  * @param ctx Pointer to DEVICE_CTX (current CUDA device)
  * @param P Pointer to Peach CUDA context (cfg_skip, cfg_skip_auto)
  * @returns compute capability (major) of the device, 0 if unknown
@@ -1264,6 +1279,7 @@ static int peach_cuda_skip_default(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
          P->cfg_skip[i] = i < PEACH_CUDA_SKIP_LATE_ROUND ?
             PEACH_PIPE_SKIP_MD2 : 0;
       }
+      P->cfg_skip[0] = PEACH_CUDA_SKIP_LATE_R0;
    }
 
    return major;
@@ -1271,8 +1287,36 @@ static int peach_cuda_skip_default(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
 
 /**
  * @private
+ * Does a round 0 skip mask drop about half of the nonces (or more) on
+ * every map? A Peach jump from a tile uses one of two algorithms, a or
+ * a + 4, where a = 0..3 depends only on the tile (the 4 transition
+ * chains of a tile agree modulo 4: checked for tile 0 of 3000 maps and
+ * for 20000 tiles of one map) and the nonce picks one of the two, each
+ * for about half of the nonces. About 95% of the nonces start on tile 0,
+ * so a mask with an algorithm of every pair drops about half of the
+ * nonces in round 0, whatever the map.
+ * @param mask0 Skip mask of round 0
+ * @returns 1 if @a mask0 drops a or a + 4 for every a = 0..3, else 0
+*/
+static int peach_cuda_half0(word8 mask0)
+{
+   int a;
+
+   for (a = 0; a < 4; a++) {
+      if (((mask0 >> a) & 1) == 0 && ((mask0 >> (a + 4)) & 1) == 0) {
+         return 0;
+      }
+   }
+
+   return 1;
+}  /* end peach_cuda_half0() */
+
+/**
+ * @private
  * Size the pipeline batch contexts of the current CUDA device. Slots per
- * batch N = PEACH_CUDA_SLOTS_PER_THREAD x SMs x maxThreadsPerSM, or
+ * batch N = PEACH_CUDA_SLOTS_PER_THREAD x SMs x maxThreadsPerSM, twice
+ * that when the round 0 skip mask drops about half of the nonces
+ * (peach_cuda_half0(): the queues of rounds 1..7 stay as dense), or
  * MCM_PEACH_BATCH when set, clamped to [128 x SMs, memory limit] and
  * rounded to whole blocks of 128 slots; the memory limit wins when both
  * bounds conflict. The memory limit fits the batch contexts, of
@@ -1328,7 +1372,8 @@ static int peach_cuda_sizing(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P,
    lo = (word32) P->sms * PEACH_PIPE_BLOCK;
    avail = mfree > reserve ? mfree - reserve : 0;
    want = P->cfg_batch ? (word64) P->cfg_batch : (word64) P->sms *
-      (word64) P->max_threads_sm * PEACH_CUDA_SLOTS_PER_THREAD;
+      (word64) P->max_threads_sm * PEACH_CUDA_SLOTS_PER_THREAD *
+      (peach_cuda_half0(P->cfg_skip[0]) ? 2 : 1);
    for (nctx = P->cfg_nctx ? P->cfg_nctx : PEACH_CUDA_NCTX_AUTO; ; nctx--) {
       n = want < lo ? lo : want;
       n = (n + PEACH_PIPE_BLOCK - 1) & ~((word64) PEACH_PIPE_BLOCK - 1);

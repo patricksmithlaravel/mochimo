@@ -23,8 +23,10 @@
  * and the speedup over the legacy solver. Configurations: legacy,
  * pipeline (defaults), then pipeline variants: MD2 dropped in every
  * round (skip mask 0x40), full evaluation (skip mask 0), MD2 dropped in
- * rounds 0..3 only (the default masks on compute capability 12.x), a
- * wider skip mask, the smallest batch size, and two and four batch
+ * rounds 0..3 only (with 32 slots per thread: the default on compute
+ * capability 12.x before round 0 also dropped SHA-256, SHA3 and Keccak
+ * with twice the slots), a wider skip mask, the smallest batch size,
+ * and two and four batch
  * contexts (streams). Time bounded: map build <= 300 s, solving as
  * below.
  * <br />
