@@ -84,9 +84,13 @@ static inline cudaError_t peach_emu_memset_async(void *ptr, int val,
 #define PEACH_LDG128(ptr)  __ldg((const uint4 *) (ptr))
 
 /* read-only load of a 16-byte Peach map tile vector -- device code ONLY,
- * as above. sm_80+: PTX with an L2 prefetch-size hint, see
- * peach_ldg_tile(); older targets: PEACH_LDG128(). */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+ * as above. sm_80+ built with CUDA 11.4 or newer: PTX with an L2
+ * prefetch-size hint, see peach_ldg_tile() (its .L1::evict_last and
+ * .L2::256B qualifiers need PTX ISA 7.4, which CUDA 11.4 introduced);
+ * older targets or toolkits: PEACH_LDG128(). */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && \
+      defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 11 || \
+      (__CUDACC_VER_MAJOR__ == 11 && __CUDACC_VER_MINOR__ >= 4))
 /**
  * @private
  * Read-only 128-bit load of a Peach map tile vector with the L2
