@@ -135,7 +135,8 @@ typedef struct {
    word32 tail[7];      /**< bt[64..91] as 7 raw LE words */
    word32 nonce_lo[4];  /**< nonce words 0..3 (host trigg_generate()) */
    word32 q;            /**< op after n0..n3 (index independent) */
-   word32 diff;         /**< difficulty, clamped, > 0 */
+   word32 diff;         /**< difficulty, clamped (0: every final hash
+                           meets it, as in trigg_eval()) */
    word32 nslots;       /**< slots in batch, <= cap, multiple of 128 */
    word32 epoch;        /**< batch epoch, copied to the result (> 0) */
    word32 pad;          /**< padding (8-byte alignment of skip) */

@@ -44,14 +44,22 @@
  *     (gpuminer) gets the configured solver;
  * (7) peach_free_cuda_device() + re-initialization with another
  *     configuration; no leaks, double frees or invalid handles;
- * (8) pipeline: a trailer with difficulty 0: no batch, one alert.
- * In pipeline mode, every batch launch is checked against the trailer
- * presented to peach_solve_cuda() and the map: phash, clamped non-zero
- * difficulty, a new epoch, the first nonce half (valid haiku without a
- * NaN replacement, q), midstate, tail, skip masks and slots; the
- * transition table must be built from the complete map once both
- * streams finished their map chunks, and must be finished before a
- * batch starts. peach_pipeline_cuda_device() must agree with the mode.
+ * (8) pipeline: a trailer with difficulty 0: every final hash solves (as
+ *     consensus and the legacy solver), solves are verified;
+ * (9) pipeline: polling intervals of seconds (gpuminer -d); a pause of
+ *     the caller while the trailer changes twice, and a change without a
+ *     pause: solves only for a trailer gpuminer can send;
+ * (10) one device fails on a CUDA error during a poll: the next device,
+ *     polled from the same host thread, keeps working.
+ * In pipeline mode, every reported solve must be for gpuminer's current
+ * or previous trailer (the only ones it sends), and every batch launch
+ * is checked against the trailer presented to peach_solve_cuda() and the
+ * map: phash, clamped difficulty, a new epoch, the first nonce half
+ * (valid haiku without a NaN replacement, q), midstate, tail, skip masks
+ * and slots; the transition table must be built from the complete map
+ * once both streams finished their map chunks, and must be finished
+ * before a batch starts. peach_pipeline_cuda_device() must agree with
+ * the mode.
  * <br />
  * Map builds: the first build of a phash runs the real kcu_peach_build()
  * on all tiles in worker processes; the map is cached (per phash), and
@@ -177,6 +185,9 @@ static void peach_host_plogx(int ll, const char *file, int line,
 #define DIFF_NEVER      48       /* practically never solves */
 #define MAIN_THREAD     0        /* gpuminer: initializes the devices */
 #define DEVICE_THREAD   1        /* gpuminer: device loop (solving) */
+
+/* ms between polls of rig_poll() (gpuminer -d, default DYNASLEEP) */
+static double PollMs = DYNASLEEP;
 
 /* failed checks */
 static unsigned long Fails;
@@ -603,6 +614,7 @@ static struct {
    word64 bad;                   /* reported solves failing a check */
    word64 prev_candidate;        /* solves for an earlier candidate of
                                     the same block (allowed) */
+   BTRAILER last;                /* the last verified solve */
    word64 polls;                 /* polls */
    int pause;                    /* gpuminer: no solving while expired
                                     or without transactions */
@@ -612,6 +624,8 @@ static struct {
 } R;
 
 #define PCTX   ((PEACH_CUDA_CTX *) R.dev.peach)
+
+static int pipeline_active(void);
 
 /**
  * Make a fresh candidate trailer of block @a bnum on phash variant
@@ -698,7 +712,18 @@ static void rig_solved(void)
    }
    if (ok) {
       R.solves++;
+      R.last = *s;
       if (memcmp(s, &R.bt, 92) != 0) R.prev_candidate++;
+      /* gpuminer sends a solve only if it matches its current or its
+       * previous trailer (BT_curr, BT_prev; presented in this order),
+       * else it pauses for the rest of the block: the pipeline solver
+       * must report nothing else */
+      if (memcmp(s, &R.bt, 92) != 0 && (R.nfamily < 2 ||
+            memcmp(s, &R.family[R.nfamily - 2], 92) != 0) &&
+            pipeline_active()) {
+         CHECK(0, "pipeline reported a solve for a trailer gpuminer cannot"
+            " send (neither its current nor its previous one)");
+      }
    } else R.bad++;
    if (R.keep) memset(&R.btout, 0, sizeof(R.btout));
 }  /* end rig_solved() */
@@ -712,7 +737,7 @@ static int rig_poll(void)
 {
    int ecode;
 
-   emu_rt_sleep(DYNASLEEP);
+   emu_rt_sleep(PollMs);
    R.polls++;
    if (R.pause && (get32(R.bt.tcount) == 0 || difftime(emu_rt_time(NULL),
          get32(R.bt.time0)) >= BRIDGEv3)) return VERROR;
@@ -982,7 +1007,7 @@ static void check_transitions_launch(const uint4 *d_map, word16 *d_T,
  * on entry of peach_solve_cuda()) and to the phash of the map, the
  * transition table was built from that complete map after its last
  * chunk and has finished, and the batch parameters derive from the
- * batch's own trailer snapshot (h_bt[id]): clamped non-zero difficulty,
+ * batch's own trailer snapshot (h_bt[id]): clamped difficulty,
  * first nonce half (valid haiku, no NaN replacement, q), midstate, tail,
  * skip masks, slots, a new epoch; no unharvested batch is overwritten.
 */
@@ -1016,9 +1041,9 @@ static void check_batch_launch(cudaStream_t s)
       !emu_rt__busy(ts))), "batch %d launched while the transition table"
       " may still be built (on the other stream)", id);
    /* gpuminer passes diff 0: the clamped difficulty is difficulty[0] */
-   CHECK(p->diff == (word32) hb->difficulty[0] && p->diff > 0, "batch %d"
-      " difficulty %u, trailer difficulty %u (expected equal, > 0)", id,
-      (unsigned) p->diff, (unsigned) hb->difficulty[0]);
+   CHECK(p->diff == (word32) hb->difficulty[0], "batch %d difficulty %u,"
+      " trailer difficulty %u (expected equal)", id, (unsigned) p->diff,
+      (unsigned) hb->difficulty[0]);
    memcpy(nlo, hb->nonce, sizeof(nlo));
    CHECK(memcmp(p->nonce_lo, nlo, sizeof(nlo)) == 0, "batch %d nonce_lo is"
       " not the first nonce half of its trailer", id);
@@ -1482,7 +1507,66 @@ static void scenario_allocfail(const char *legacy)
 }  /* end scenario_allocfail() */
 
 /**
- * Legacy scenarios: (1), (4), (3), (7), (6).
+ * (10) gpuminer polls every device from one host thread: an error that
+ * fails one device must not be left for the first cudaGetLastError() of
+ * the next device polled. Device 0 fails on an injected (non-sticky)
+ * error of @a api (@a err), in DEV_WORK if @a work is set, else during
+ * its map build; device 1 (initialized as well) must keep working.
+ * @a legacy selects the configuration.
+*/
+static void scenario_cascade(const char *legacy, const char *api,
+   cudaError_t err, int work)
+{
+   DEVICE_CTX d1;
+   int rc, n, garbage;
+
+   printf("   device 0 fails on %s (%d) in %s\n", api, (int) err,
+      work ? "DEV_WORK" : "DEV_INIT");
+   emu_clear_errors();
+   emu_rt.dev.count = 2;
+   if (dev_start(legacy, NULL, NULL)) {
+      emu_rt.dev.count = 1;
+      return;
+   }
+   memset(&d1, 0, sizeof(d1));
+   d1.id = 1;
+   d1.type = CUDA_DEVICE;
+   d1.status = DEV_NULL;
+   emu_rt_thread(MAIN_THREAD);
+   /* (no garbage fill: device 1 only starts its map build, which then
+    * needs no second GiB of memory) */
+   garbage = emu_rt.garbage;
+   emu_rt.garbage = 0;
+   rc = peach_init_cuda_device(&d1);
+   emu_rt.garbage = garbage;
+   CHECK(rc == VEOK && d1.status == DEV_INIT, "device 1: init = %d,"
+      " status %d", rc, d1.status);
+   R.pause = R.keep = 1;
+   rig_block(PHASH_A, get32(R.bt.bnum) + 1, DIFF_SOLVE);
+   if (work) rig_build();
+   emu_rt_fault(api, 1, err, 0);
+   for (n = 0; n < 200 && R.dev.status >= DEV_NULL; n++) rig_poll();
+   CHECK(emu_rt_fault_clear() == 1 && R.dev.status == DEV_FAIL, "device 0"
+      " did not fail on %s (status %d)", api, R.dev.status);
+   /* the device thread polls the next device */
+   emu_rt_thread(DEVICE_THREAD);
+   for (n = 0; n < 4 && d1.status >= DEV_NULL; n++) {
+      emu_rt_sleep(DYNASLEEP);
+      (void) peach_solve_cuda(&d1, &R.bt, 0, &R.btout);
+   }
+   emu_rt_thread(MAIN_THREAD);
+   CHECK(d1.status >= DEV_NULL, "device 1 failed after device 0 failed on"
+      " %s: %s", api, LastAlert);
+   rc = peach_free_cuda_device(&d1);
+   CHECK(rc == VEOK, "device 1: peach_free_cuda_device() = %d", rc);
+   dev_free();
+   emu_rt.dev.count = 1;
+   /* errors left by this scenario must not affect later scenarios */
+   emu_clear_errors();
+}  /* end scenario_cascade() */
+
+/**
+ * Legacy scenarios: (1), (4), (3), (7), (6), (10).
 */
 static void scenarios_legacy(void)
 {
@@ -1550,6 +1634,11 @@ static void scenarios_legacy(void)
    section("L6 legacy: allocation failures during init");
    scenario_allocfail("1");
    section_end(NULL);
+
+   section("L10 legacy: a failed device does not fail the next one");
+   scenario_cascade("1", "cudaMemset", cudaErrorInvalidValue, 0);
+   scenario_cascade("1", "cudaMemcpyAsync", cudaErrorInvalidValue, 1);
+   section_end(NULL);
 }  /* end scenarios_legacy() */
 
 /**
@@ -1587,6 +1676,113 @@ static void pipeline_work_check(void)
    printf("   work +%llu over %lu batches (completed %llu)\n",
       (unsigned long long) dw, Fx.fin, (unsigned long long) Fx.fin_sum);
 }  /* end pipeline_work_check() */
+
+/**
+ * Predicate: both pipeline batch contexts have a batch of the current
+ * trailer in flight.
+*/
+static int pred_inflight(void)
+{
+   PEACH_CUDA_CTX *P = PCTX;
+   int id;
+
+   if (P == NULL || R.dev.status != DEV_WORK) return 0;
+   for (id = 0; id < 2; id++) {
+      if (!P->inflight[id] || memcmp(P->h_bt[id], &R.bt, 92) != 0) return 0;
+   }
+   return 1;
+}  /* end pred_inflight() */
+
+/**
+ * Set the fake clock to 100 ms past its next second, so that the next
+ * polls (DYNASLEEP apart) fall within one second of time(): the solver
+ * sees no pause of the caller between them.
+*/
+static void clock_align(void)
+{
+   emu_rt_advance(1100.0 - fmod(emu_rt.now_ms, 1000.0));
+}  /* end clock_align() */
+
+/**
+ * (9) Pipeline: polling intervals and outdated trailers. gpuminer sends
+ * a solve only for its current or previous trailer (rig_solved() checks
+ * every pipeline solve against both).
+ * (a) polls 1, 3 and 5 s apart (gpuminer -d) on an unchanged trailer:
+ *     batches are harvested and solves reported at any interval;
+ * (b) batches of a trailer X in flight, then a pause of the caller (no
+ *     calls) while the trailer changes twice, X -> Y -> Z: gpuminer's
+ *     previous trailer is Y, never seen by the solver, so X's batches
+ *     count as work but report no solve; solves resume for Z;
+ * (c) batches of X in flight, then X -> Y seen at the next poll (no
+ *     pause): a solve of X is still reported (gpuminer's BT_prev).
+ * Requires a working pipeline device.
+*/
+static void scenario_polling(void)
+{
+   static const double interval[] = { 1000.0, 3000.0, 5000.0 };
+   PEACH_CUDA_CTX *P = PCTX;
+   word64 s0, w0, b0, bad0, p0;
+   int i, j, n, rc;
+
+   R.pause = R.keep = 1;
+   /* (a) slow polling, unchanged trailer (40 polls < BRIDGEv3) */
+   for (j = 0; j < (int) (sizeof(interval) / sizeof(interval[0])); j++) {
+      rig_candidate(DIFF_SOLVE);
+      s0 = R.solves;
+      w0 = (word64) R.dev.work;
+      b0 = P->batches_total;
+      PollMs = interval[j];
+      for (i = 0; i < 40; i++) rig_poll();
+      PollMs = DYNASLEEP;
+      printf("   (a) polls %.0f ms apart: +%llu batches, +%llu solves, work"
+         " +%llu\n", interval[j], (unsigned long long) (P->batches_total -
+         b0), (unsigned long long) (R.solves - s0),
+         (unsigned long long) ((word64) R.dev.work - w0));
+      CHECK(P->batches_total >= b0 + 10 && R.solves > s0 &&
+         (word64) R.dev.work > w0, "(a) polls %.0f ms apart: +%llu"
+         " batches, +%llu solves (expected batches and solves)",
+         interval[j], (unsigned long long) (P->batches_total - b0),
+         (unsigned long long) (R.solves - s0));
+      CHECK(R.dev.status == DEV_WORK, "(a) status %d", R.dev.status);
+   }
+
+   /* (b) pause while the trailer changes twice (every batch solves) */
+   rig_candidate(DIFF_ALWAYS);
+   n = rig_until(pred_inflight, 40);
+   CHECK(n >= 0, "(b) no batches of the new trailer in flight");
+   for (i = 0; i < 2 * BUSY_TICKS + 2; i++) emu_rt_tick();
+   emu_rt_advance(5000.0);
+   rig_candidate(DIFF_ALWAYS);
+   rig_candidate(DIFF_ALWAYS);
+   b0 = P->batches_total;
+   bad0 = P->bad_solves;
+   rc = rig_poll();
+   CHECK(rc != VEOK, "(b) solve reported for a trailer gpuminer cannot"
+      " send");
+   CHECK(P->batches_total == b0 + 2, "(b) %llu batches harvested after the"
+      " pause, expected 2 (counted as work)",
+      (unsigned long long) (P->batches_total - b0));
+   CHECK(P->bad_solves == bad0, "(b) %llu rejected solves",
+      (unsigned long long) (P->bad_solves - bad0));
+   rig_solve(1);
+   CHECK(memcmp(&R.last, &R.bt, 92) == 0, "(b) solve after the pause is"
+      " not for the current trailer");
+
+   /* (c) change without a pause: the previous trailer's solve counts */
+   rig_candidate(DIFF_ALWAYS);
+   clock_align();
+   n = rig_until(pred_inflight, 40);
+   CHECK(n >= 0, "(c) no batches of the new trailer in flight");
+   for (i = 0; i < 2 * BUSY_TICKS + 2; i++) emu_rt_tick();
+   rig_candidate(DIFF_ALWAYS);
+   p0 = R.prev_candidate;
+   rc = rig_poll();
+   CHECK(rc == VEOK && R.prev_candidate == p0 + 1, "(c) no solve of the"
+      " previous trailer reported (gpuminer sends it as BT_prev)");
+   rig_solve(1);
+   printf("   solves %llu (%llu for an earlier candidate of the block)\n",
+      (unsigned long long) R.solves, (unsigned long long) R.prev_candidate);
+}  /* end scenario_polling() */
 
 /**
  * Start a pipeline device and build its map (cached), expect pipeline
@@ -1627,7 +1823,7 @@ static void expect_fallback(const char *what, unsigned long alerts)
 }  /* end expect_fallback() */
 
 /**
- * Pipeline scenarios: (2), (4), (3), (5), (6), (7).
+ * Pipeline scenarios: (2), (4), (3), (8), (9), (5), (6), (7), (10).
 */
 static void scenarios_pipeline(void)
 {
@@ -1710,28 +1906,30 @@ static void scenarios_pipeline(void)
    CHECK(Nlog[PLOG_ALERT] == alerts, "unexpected alert: %s", LastAlert);
    section_end(NULL);
 
-   section("P8 pipeline: trailer difficulty 0 -> no batch launched");
-   /* the clamped difficulty would be 0 (every final hash passes): no
-    * batch, one alert (per map build), no solve; then resume */
+   section("P8 pipeline: trailer difficulty 0 -> every final hash solves");
+   /* consensus (trigg_eval()) and the legacy solver accept every final
+    * hash at difficulty 0: batches run, every solve is verified */
    rig_candidate(0);
-   /* drain the batches in flight (any batch launched from now on fails
-    * check_batch_launch(): difficulty 0) */
-   for (i = 0; i < 4 * BUSY_TICKS + 4; i++) rig_poll();
-   k = emu_rt_kcfg("kcu_peach_pipe_init", 1);
-   nt = k->launches;
-   for (i = 0; i < 20; i++) {
-      CHECK(rig_poll() != VEOK, "solve reported at difficulty 0");
-   }
-   CHECK(k->launches == nt, "%lu batches launched at difficulty 0",
-      k->launches - nt);
-   CHECK(Nlog[PLOG_ALERT] == alerts + 1, "%lu alerts at difficulty 0"
-      " (expected 1): %s", Nlog[PLOG_ALERT] - alerts, LastAlert);
+   bad0 = PCTX->bad_solves;
+   rig_solve(2);
+   CHECK(R.last.difficulty[0] == 0, "difficulty 0: last solve has"
+      " difficulty %u", (unsigned) R.last.difficulty[0]);
+   CHECK(PCTX->bad_solves == bad0, "difficulty 0: %llu rejected solves",
+      (unsigned long long) (PCTX->bad_solves - bad0));
+   CHECK(Nlog[PLOG_ALERT] == alerts, "unexpected alert: %s", LastAlert);
    CHECK(R.dev.status == DEV_WORK && pipeline_active(), "difficulty 0:"
       " status %d, %s", R.dev.status, pipeline_active() ? "pipeline" :
       "legacy fallback");
    rig_candidate(DIFF_SOLVE);
    rig_solve(1);
-   CHECK(k->launches > nt, "no batch after difficulty 0");
+   section_end(NULL);
+
+   section("P9 pipeline: slow polling, outdated trailers");
+   scenario_polling();
+   CHECK(pipeline_active(), "fallback: %s", LastAlert);
+   CHECK(PCTX->bad_solves == 0, "%llu rejected solves",
+      (unsigned long long) PCTX->bad_solves);
+   CHECK(Nlog[PLOG_ALERT] == alerts, "unexpected alert: %s", LastAlert);
    section_end(NULL);
    dev_free();
 
@@ -1863,6 +2061,12 @@ static void scenarios_pipeline(void)
       rig_solve(2);
       dev_free();
    }
+   section_end(NULL);
+
+   section("P10 pipeline: a failed device does not fail the next one");
+   scenario_cascade("0", "cudaMemset", cudaErrorInvalidValue, 0);
+   scenario_cascade("0", "cudaEventRecord", cudaErrorInvalidValue, 1);
+   scenario_cascade("0", "cudaStreamQuery", cudaErrorLaunchFailure, 1);
    section_end(NULL);
 }  /* end scenarios_pipeline() */
 

@@ -1,7 +1,12 @@
 /**
  * @file peach-gpuab-cu.c
  * @brief GPU A/B test of the Peach CUDA solvers: legacy vs pipeline.
- * @details GPU only; without a usable CUDA device the test is skipped
+ * @details OPT-IN (several minutes of GPU time): without
+ * PEACH_TEST_GPUAB=1 the test prints a SKIP line and succeeds, so that
+ * `make test` (which runs every *-cu test when nvcc is found) does not
+ * turn into a benchmark. Run it with:
+ * <br />`make test-peach-gpuab PEACH_TEST_GPUAB=1`
+ * <br />GPU only; without a usable CUDA device the test is skipped
  * (exit 0). For each configuration, one CUDA device is initialized with
  * peach_init_cuda_device() under that configuration's environment
  * (MCM_PEACH_LEGACY, MCM_PEACH_SKIP, MCM_PEACH_BATCH), the Peach map is
@@ -283,6 +288,12 @@ int main(void)
    int count, devidx, i, sweep, fails;
    long diff;
 
+   /* opt-in (see above) */
+   if (env_long("PEACH_TEST_GPUAB", 0, 0, 1) != 1) {
+      printf("SKIP: Peach GPU A/B test (minutes of GPU time; set"
+         " PEACH_TEST_GPUAB=1 to run it)\n");
+      return 0;
+   }
    /* skip without a usable CUDA device (no driver, or no device) */
    count = 0;
    err = cudaGetDeviceCount(&count);

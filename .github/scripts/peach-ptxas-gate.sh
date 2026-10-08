@@ -4,18 +4,26 @@
 # Copyright 2025 Adequate Systems, LLC. All Rights Reserved.
 #
 # Usage (from the repository root, submodules initialized):
-#    .github/scripts/peach-ptxas-gate.sh [<sm> ...]
+#    .github/scripts/peach-ptxas-gate.sh [<target> ...]
 #
-# Compiles src/peach.cu once per listed architecture (default: 61 75 86 89
-# 90 120) with ptxas verbose output, and checks every kcu_peach_pipe_*
-# kernel: a non-zero stack frame, spill store or spill load fails the gate.
-# Other kernels (the official kcu_peach_* kernels) are listed, not gated.
+# A target is an architecture <sm> (e.g. 86: src/peach.cu compiled for
+# sm_<sm>), or <virt>:<sm> (e.g. 52:86: the compute_<virt> PTX of
+# src/peach.cu compiled by ptxas for sm_<sm>, as the driver JIT does when
+# a binary without sm_<sm> code runs on such a GPU; a build without
+# -arch, like `make all`, ships sm_52 code and compute_52 PTX only).
+# Default targets: 52 61 75 86 89 90 120 52:86 52:120.
+# Each target is compiled with ptxas verbose output, and every
+# kcu_peach_pipe_* kernel is checked: a non-zero stack frame, spill store
+# or spill load fails the gate. Other kernels (the official kcu_peach_*
+# kernels) are listed, not gated.
 #
 # Environment:
 #    NVCC                    nvcc to use (default: nvcc on PATH, else
 #                            /usr/local/cuda/bin/nvcc)
+#    PTXAS                   ptxas to use for <virt>:<sm> targets (default:
+#                            ptxas next to nvcc, else ptxas on PATH)
 #    PEACH_GATE_MIN_KERNELS  minimum number of kcu_peach_pipe_* kernels
-#                            required per architecture (default 0: none
+#                            required per target (default 0: none
 #                            found is reported and passes)
 #
 # Exit status: 0 pass, 1 gate failure, 2 usage or compile error.
@@ -26,7 +34,11 @@ set -u
 NVCC=${NVCC:-$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)}
 MIN=${PEACH_GATE_MIN_KERNELS:-0}
 ARCHS=("$@")
-if [ ${#ARCHS[@]} -eq 0 ]; then ARCHS=(61 75 86 89 90 120); fi
+if [ ${#ARCHS[@]} -eq 0 ]; then
+   ARCHS=(52 61 75 86 89 90 120 52:86 52:120)
+fi
+PTXAS=${PTXAS:-$(dirname "$(command -v "$NVCC" || echo "$NVCC")")/ptxas}
+if [ ! -x "$PTXAS" ]; then PTXAS=$(command -v ptxas || echo ptxas); fi
 
 if [ ! -f src/peach.cu ]; then
    echo "error: run from the repository root (src/peach.cu not found)" >&2
@@ -49,24 +61,52 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 STATUS=0
-for SM in "${ARCHS[@]}"; do
-   case "$SM" in
-      ''|*[!0-9]*) echo "error: invalid architecture '$SM'" >&2; exit 2 ;;
+for TARGET in "${ARCHS[@]}"; do
+   case "$TARGET" in
+      *:*) VIRT=${TARGET%%:*}; SM=${TARGET#*:}
+         case "$VIRT" in
+            ''|*[!0-9]*) echo "error: invalid target '$TARGET'" >&2; exit 2 ;;
+         esac ;;
+      *) VIRT=""; SM=$TARGET ;;
    esac
-   LOG="$TMP/ptxas_sm$SM.log"
-   echo "== sm_$SM: nvcc -c src/peach.cu -Xptxas -v"
-   if ! "$NVCC" -c src/peach.cu -o "$TMP/peach_sm$SM.o" "${INCS[@]}" \
-         -Xptxas -Werror -Xptxas -v -Wno-deprecated-gpu-targets \
-         -gencode "arch=compute_$SM,code=sm_$SM" > "$LOG" 2>&1; then
-      cat "$LOG" >&2
-      echo "error: compilation for sm_$SM failed" >&2
-      exit 2
+   case "$SM" in
+      ''|*[!0-9]*) echo "error: invalid target '$TARGET'" >&2; exit 2 ;;
+   esac
+   if [ -z "$VIRT" ]; then
+      LABEL="sm_$SM"
+      LOG="$TMP/ptxas_sm$SM.log"
+      echo "== $LABEL: nvcc -c src/peach.cu -Xptxas -v"
+      if ! "$NVCC" -c src/peach.cu -o "$TMP/peach_sm$SM.o" "${INCS[@]}" \
+            -Xptxas -Werror -Xptxas -v -Wno-deprecated-gpu-targets \
+            -gencode "arch=compute_$SM,code=sm_$SM" > "$LOG" 2>&1; then
+         cat "$LOG" >&2
+         echo "error: compilation for $LABEL failed" >&2
+         exit 2
+      fi
+   else
+      LABEL="compute_${VIRT}->sm_$SM"
+      LOG="$TMP/ptxas_c${VIRT}_sm$SM.log"
+      PTX="$TMP/peach_compute$VIRT.ptx"
+      echo "== $LABEL: nvcc -ptx src/peach.cu, then ptxas -v"
+      if [ ! -f "$PTX" ] && ! "$NVCC" -ptx src/peach.cu -o "$PTX" \
+            "${INCS[@]}" -Wno-deprecated-gpu-targets \
+            -arch="compute_$VIRT" > "$LOG" 2>&1; then
+         cat "$LOG" >&2
+         echo "error: PTX compilation for compute_$VIRT failed" >&2
+         exit 2
+      fi
+      if ! "$PTXAS" -arch="sm_$SM" -v -Werror "$PTX" \
+            -o "$TMP/peach_c${VIRT}_sm$SM.cubin" > "$LOG" 2>&1; then
+         cat "$LOG" >&2
+         echo "error: ptxas of the compute_$VIRT PTX for sm_$SM failed" >&2
+         exit 2
+      fi
    fi
    # ptxas -v reports, per function:
    #    ptxas info    : Function properties for <name>
    #        <n> bytes stack frame, <n> bytes spill stores, <n> bytes spill loads
    #    ptxas info    : Used <n> registers, ...
-   awk -v sm="$SM" -v min="$MIN" '
+   awk -v sm="$LABEL" -v min="$MIN" '
       function report() {
          if (fn == "") return
          gated = (fn ~ /kcu_peach_pipe_/)
@@ -101,17 +141,17 @@ for SM in "${ARCHS[@]}"; do
       END {
          report()
          if (nk == 0) {
-            printf("   sm_%s: no kcu_peach_pipe_* kernels found", sm)
+            printf("   %s: no kcu_peach_pipe_* kernels found", sm)
             if (min > 0) {
                printf(" (%d required) -> FAIL\n", min); exit 1
             }
             printf(" (pipeline kernels not built yet) -> nothing to gate\n")
             exit 0
          }
-         printf("   sm_%s: %d kcu_peach_pipe_* kernel(s), %d with %s\n",
+         printf("   %s: %d kcu_peach_pipe_* kernel(s), %d with %s\n",
             sm, nk, nbad, "stack frame or spills")
          if (nk < min) {
-            printf("   sm_%s: fewer than %d kernels -> FAIL\n", sm, min)
+            printf("   %s: fewer than %d kernels -> FAIL\n", sm, min)
             exit 1
          }
          exit (nbad > 0 ? 1 : 0)

@@ -63,12 +63,20 @@
 #define PEACH_CUDA_REDRAW_MAX       64   /**< first nonce half draws per
    batch before the batch is skipped (host redraw rule) */
 #define PEACH_CUDA_BATCH_MS         250  /**< batch time limit, in ms; two
-   slower batches in a row halve the slots of later batches */
+   slower batches in a row halve the slots of later batches. Measured
+   from enqueue to completion while the other context's batch shares the
+   GPU, so about twice the time of the batch alone */
 #define PEACH_CUDA_BATCH_GROW       8    /**< consecutive batches faster
-   than PEACH_CUDA_BATCH_MS / 4 that double the slots again (up to cap) */
-#define PEACH_CUDA_POLL_GAP         2    /**< seconds between two polls
-   after which in-flight batch results are discarded (the caller paused,
-   so they may belong to a trailer this solver never saw) */
+   than 2/5 of PEACH_CUDA_BATCH_MS (a doubled batch stays well below the
+   limit) that double the slots again (up to cap) */
+#define PEACH_CUDA_TRAILER_ID       92   /**< leading block trailer bytes
+   that identify a solve target (phash .. mroot, before the nonce):
+   gpuminer sends a solve only if they match its current or previous
+   trailer */
+#define PEACH_CUDA_POLL_GAP         1    /**< seconds (of time()) between
+   two pipeline solver calls that count as a pause of the caller: a
+   trailer change seen after a pause may hide trailers this solver never
+   saw, so batches of the trailer before it report no solve */
 #define PEACH_CUDA_CANARY_FIRST     16   /**< canary check of every batch
    up to this many batches after a map build ... */
 #define PEACH_CUDA_CANARY_EVERY     64   /**< ... then of every 64th */
@@ -124,6 +132,14 @@ typedef struct {
    int fast_batches;                   /**< consecutive fast batches */
    time_t last_poll;                   /**< time of the previous pipeline
                                           solver call (0 = none) */
+   word8 trail_curr[PEACH_CUDA_TRAILER_ID];  /**< identifying bytes of
+                                          the latest trailer seen */
+   word8 trail_prev[PEACH_CUDA_TRAILER_ID];  /**< ... of the distinct
+                                          trailer seen before it */
+   int trail_prev_ok;                  /**< trail_prev is the caller's
+                                          previous trailer too: the
+                                          change was seen without a
+                                          pause (PEACH_CUDA_POLL_GAP) */
    /* pipeline: per device */
    word16 *d_T;                        /**< transition table, T[tile] */
    word32 *d_selftest;                 /**< self-test vectors: input,
@@ -133,8 +149,6 @@ typedef struct {
                                           tile); ctx->work counts hashes */
    word32 epoch;                       /**< epoch, bumped on DEV_INIT and
                                           on every batch launch (never 0) */
-   int alerted_diff;                   /**< zero difficulty alerted (once
-                                          per map build) */
    PEACH_PIPE_LAUNCH launch;           /**< launch configuration */
    /* pipeline: per batch context (one per stream) */
    PEACH_PIPE_PARAMS params[2];        /**< in-flight batch parameters */
@@ -962,9 +976,17 @@ __global__ void kcu_peach_checkhash
 
 /**
  * @private
- * Take a consistent snapshot of a block trailer that another thread may
+ * Take a stable snapshot of a block trailer that another thread may
  * update concurrently: copy it twice (volatile reads, so the two copies
  * are really taken from @a bt) until both copies are equal.
+ * @note Best effort, not a consistency guarantee: without the writer's
+ * cooperation (gpuminer updates its trailer with a plain memcpy()), this
+ * detects a copy in progress during the reads, but not a writer that was
+ * preempted partway through its copy (both reads then see the same mix
+ * of old and new bytes). Every solve is verified on the CPU against the
+ * snapshot it was searched for, so such a mixed trailer cannot yield an
+ * invalid solve; at worst (very unlikely) a valid solve for a trailer
+ * the caller never had, which it cannot send.
  * @param bt Pointer to (shared) block trailer
  * @param snap Pointer to location to place the snapshot
  * @returns VEOK on success, else VERROR (no stable copy was obtained)
@@ -1600,6 +1622,8 @@ int peach_init_cuda_device(DEVICE_CTX *ctx)
          const char *str = cudaGetErrorString(err); \
          palert("CUDA ERROR on #(%d): (%d) %s", ctx->id, (int) err, str); \
          palert("... error returned by: %s", #cuFN); \
+         /* clear the (non-sticky) error: never left to another device */ \
+         (void) cudaGetLastError(); \
          ctx->status = DEV_FAIL; \
          return VERROR; \
       } \
@@ -1757,6 +1781,8 @@ static int peach_solve_cuda_legacy(DEVICE_CTX *ctx, const BTRAILER *bt,
          const char *str = cudaGetErrorString(err); \
          palert("CUDA ERROR on #(%d): (%d) %s", ctx->id, (int) err, str); \
          palert("... error returned by: %s", #cuFN); \
+         /* clear the (non-sticky) error: never left to another device */ \
+         (void) cudaGetLastError(); \
          ctx->status = DEV_FAIL; \
          return VERROR; \
       } \
@@ -1989,6 +2015,8 @@ static int peach_cuda_selftest(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P,
          const char *str = cudaGetErrorString(err); \
          palert("CUDA ERROR on #(%d): (%d) %s", ctx->id, (int) err, str); \
          palert("... error returned by: %s", #cuFN); \
+         /* clear the (non-sticky) error: never left to another device */ \
+         (void) cudaGetLastError(); \
          ctx->status = DEV_FAIL; \
          free(in); \
          return (-1); \
@@ -2090,23 +2118,27 @@ static int peach_cuda_selftest(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P,
  * overflow or prefix anomaly abandons the pipeline solver; two batches in
  * a row slower than PEACH_CUDA_BATCH_MS halve the slots of later batches
  * (not below nslots_min), and PEACH_CUDA_BATCH_GROW fast batches in a row
- * double them again (up to cap); the canary (final queue entry 0) is verified on the CPU
- * for the first PEACH_CUDA_CANARY_FIRST batches after a map build, then
- * every PEACH_CUDA_CANARY_EVERY-th batch; a solve is composed from the
- * batch's own trailer snapshot h_bt[id] (incl. its first nonce half) and
- * the device's second nonce half, and copied to @a btout only after
- * peach_checkhash() on the CPU confirmed it, and its final hash, at the
- * batch difficulty. A canary mismatch or a rejected solve abandons the
- * pipeline solver (never touching @a btout).
+ * double them again (up to cap); the canary (final queue entry 0) is
+ * verified on the CPU for the first PEACH_CUDA_CANARY_FIRST batches after
+ * a map build, then every PEACH_CUDA_CANARY_EVERY-th batch; a solve is
+ * composed from the batch's own trailer snapshot h_bt[id] (incl. its
+ * first nonce half) and the device's second nonce half, verified with
+ * peach_checkhash() on the CPU (and its final hash) at the batch
+ * difficulty, and copied to @a btout only if @a report is set. A canary
+ * mismatch or a rejected solve abandons the pipeline solver (never
+ * touching @a btout).
  * @param ctx Pointer to DEVICE_CTX
  * @param P Pointer to its Peach CUDA context
  * @param id Batch context (stream) number
  * @param btout Pointer to location to place solved block trailer
+ * @param report Non-zero if a solve of this batch may be reported: its
+ * trailer is one the caller can still send a solve for (see
+ * peach_cuda_reportable()); else the batch only counts as work
  * @returns 1 if a verified solve was copied to @a btout, 0 if not, or
  * (-1) if the pipeline solver was abandoned (fallback)
 */
 static int peach_cuda_harvest(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
-   BTRAILER *btout)
+   BTRAILER *btout, int report)
 {
    PEACH_PIPE_RESULT res;
    BTRAILER cand;
@@ -2133,8 +2165,9 @@ static int peach_cuda_harvest(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
    }
 
    /* adaptive batch size: two slow batches in a row halve later batches
-    * (a single outlier is ignored); a run of fast batches doubles them
-    * again, up to the capacity */
+    * (a single outlier is ignored); a run of batches fast enough to stay
+    * well below the limit when doubled (2/5 of it) doubles them again, up
+    * to the capacity */
    if (cudaEventElapsedTime(&ms, P->ev_start[id], P->ev_stop[id]) !=
          cudaSuccess) {
       (void) cudaGetLastError();  /* no timing: keep the batch size */
@@ -2152,8 +2185,9 @@ static int peach_cuda_harvest(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
       }
    } else {
       P->slow_batches = 0;
-      if (ms < (float) PEACH_CUDA_BATCH_MS / 4 && P->nslots < P->cap &&
-            ++(P->fast_batches) >= PEACH_CUDA_BATCH_GROW) {
+      if (ms >= (float) PEACH_CUDA_BATCH_MS * 2 / 5 || P->nslots >= P->cap) {
+         P->fast_batches = 0;  /* (in a row) */
+      } else if (++(P->fast_batches) >= PEACH_CUDA_BATCH_GROW) {
          n = P->nslots * 2;
          if (n > P->cap || n < P->nslots) n = P->cap;
          pdebug("CUDA #%d: pipeline batches of %u slots took %.0f ms;"
@@ -2184,6 +2218,11 @@ static int peach_cuda_harvest(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
             res.hash, 0) != VEOK) {
          return peach_cuda_fallback(ctx, P, "solve rejected by the CPU");
       }
+      if (!report) {
+         pdebug("CUDA #%d: solve for an outdated block trailer (block"
+            " 0x%x) not reported", ctx->id, (unsigned) get32(cand.bnum));
+         return 0;
+      }
       memcpy(btout, &cand, sizeof(BTRAILER));
       return 1;
    }
@@ -2202,8 +2241,9 @@ static int peach_cuda_harvest(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
  * 64..91, the first nonce half, q, the clamped difficulty, the slots per
  * batch, a new epoch and the packed skip masks. Then: start event,
  * peach_pipe_enqueue(), asynchronous copy of the result to h_res[id],
- * stop event. Nothing is launched when the clamped difficulty is 0
- * (alerted once per map build) or when no first half qualifies (alerted).
+ * stop event. Nothing is launched when no first half qualifies
+ * (alerted). A clamped difficulty of 0 (a trailer of difficulty 0)
+ * accepts every final hash, as trigg_eval() and the official solver do.
  * @param ctx Pointer to DEVICE_CTX
  * @param P Pointer to its Peach CUDA context
  * @param id Batch context (stream) number
@@ -2230,21 +2270,16 @@ static int peach_cuda_launch(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
          const char *str = cudaGetErrorString(err); \
          palert("CUDA ERROR on #(%d): (%d) %s", ctx->id, (int) err, str); \
          palert("... error returned by: %s", #cuFN); \
+         /* clear the (non-sticky) error: never left to another device */ \
+         (void) cudaGetLastError(); \
          ctx->status = DEV_FAIL; \
          return (-1); \
       } \
    } while(0)
 
-   /* clamped difficulty, as the official solver; never 0 */
+   /* clamped difficulty, as the official solver (0 only for a trailer
+    * of difficulty 0, where every final hash is a valid solve) */
    diff = diff && diff < bt->difficulty[0] ? diff : bt->difficulty[0];
-   if (diff == 0) {
-      if (!P->alerted_diff) {
-         palert("CUDA #%d: difficulty 0, no pipeline batch launched",
-            ctx->id);
-         P->alerted_diff = 1;
-      }
-      return 0;
-   }
 
    /* host redraw rule: first nonce half without NaN replacement */
    q = 0;
@@ -2303,6 +2338,58 @@ static int peach_cuda_launch(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
 
 /**
  * @private
+ * Track the block trailers presented to the pipeline solver of a device
+ * (once per call): the latest one, and the distinct one seen before it,
+ * compared on their first PEACH_CUDA_TRAILER_ID bytes, as gpuminer
+ * matches a solve with its current and previous trailer before sending
+ * it. A change seen after a pause of the caller (at least
+ * PEACH_CUDA_POLL_GAP seconds of time() since the previous call) may
+ * hide trailers this solver never saw, so the trailer seen before it may
+ * no longer be the caller's previous one (see peach_cuda_reportable()).
+ * The caller's trailer changes at most once per network interval (at
+ * least one second), so without a pause no trailer is missed.
+ * @param P Pointer to Peach CUDA context
+ * @param bt Pointer to (snapshot of the) block trailer of this call
+*/
+static void peach_cuda_track(PEACH_CUDA_CTX *P, const BTRAILER *bt)
+{
+   time_t now;
+   int pause;
+
+   now = time(NULL);
+   pause = P->last_poll == 0 ||
+      difftime(now, P->last_poll) >= PEACH_CUDA_POLL_GAP;
+   P->last_poll = now;
+   if (memcmp(P->trail_curr, bt, PEACH_CUDA_TRAILER_ID) != 0) {
+      memcpy(P->trail_prev, P->trail_curr, PEACH_CUDA_TRAILER_ID);
+      memcpy(P->trail_curr, bt, PEACH_CUDA_TRAILER_ID);
+      P->trail_prev_ok = !pause;
+   }
+}  /* end peach_cuda_track() */
+
+/**
+ * @private
+ * May a solve found by the batch of pipeline context @a id be reported?
+ * Only if the caller can still send it: the batch's trailer (h_bt[id])
+ * is the latest trailer seen, or the one before it when that change was
+ * seen without a pause (see peach_cuda_track()). Otherwise the batch
+ * still counts as work, but its solve is not reported (it would pause
+ * the caller for the rest of the block without being sent).
+ * @param P Pointer to Peach CUDA context
+ * @param id Batch context (stream) number
+ * @returns 1 if reportable, else 0
+*/
+static int peach_cuda_reportable(const PEACH_CUDA_CTX *P, int id)
+{
+   const void *b = P->h_bt[id];
+
+   if (memcmp(b, P->trail_curr, PEACH_CUDA_TRAILER_ID) == 0) return 1;
+   return P->trail_prev_ok &&
+      memcmp(b, P->trail_prev, PEACH_CUDA_TRAILER_ID) == 0;
+}  /* end peach_cuda_reportable() */
+
+/**
+ * @private
  * Pipeline Peach CUDA solver: the official state machine on two streams,
  * with one pipeline batch context per stream, and these rules:
  * - DEV_INIT: the map build cursor is P->build_next (ctx->work counts
@@ -2314,8 +2401,11 @@ static int peach_cuda_launch(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P, int id,
  * - DEV_WORK, per idle stream, in this order: a trailer phash other than
  *   the map's -> DEV_INIT; no transactions, block already solved or
  *   expired -> DEV_IDLE (results discarded, nothing reported); harvest
- *   the batch result (peach_cuda_harvest()); launch the next batch
- *   (peach_cuda_launch()).
+ *   the batch result (peach_cuda_harvest()), reporting its solve only if
+ *   the caller can still send it (peach_cuda_reportable()); launch the
+ *   next batch (peach_cuda_launch()).
+ * Every call tracks the trailers seen (peach_cuda_track()), at any
+ * polling interval of the caller.
  * Any pipeline defect switches the device to the legacy solver.
  * @param ctx Pointer to DEVICE_CTX to perform work with
  * @param bt Pointer to (snapshot of the) block trailer to solve for
@@ -2329,8 +2419,7 @@ static int peach_solve_cuda_pipeline(DEVICE_CTX *ctx, const BTRAILER *bt,
 {
    PEACH_CUDA_CTX *P;
    double delta;
-   time_t now;
-   int id, i, grid, block, build, rc, stale;
+   int id, i, grid, block, build, rc;
    cudaError_t err;
 
 #undef cuCHK
@@ -2341,6 +2430,8 @@ static int peach_solve_cuda_pipeline(DEVICE_CTX *ctx, const BTRAILER *bt,
          const char *str = cudaGetErrorString(err); \
          palert("CUDA ERROR on #(%d): (%d) %s", ctx->id, (int) err, str); \
          palert("... error returned by: %s", #cuFN); \
+         /* clear the (non-sticky) error: never left to another device */ \
+         (void) cudaGetLastError(); \
          ctx->status = DEV_FAIL; \
          return VERROR; \
       } \
@@ -2350,12 +2441,8 @@ static int peach_solve_cuda_pipeline(DEVICE_CTX *ctx, const BTRAILER *bt,
    P = (PEACH_CUDA_CTX *) ctx->peach;
    /* report unuseable GPUs */
    if (ctx->status < DEV_NULL) return VETIMEOUT;
-   /* a long gap since the previous call means the caller paused (e.g.
-    * on a trailer without transactions); see step (0) below */
-   now = time(NULL);
-   stale = P->last_poll != 0 &&
-      difftime(now, P->last_poll) > PEACH_CUDA_POLL_GAP;
-   P->last_poll = now;
+   /* the trailers seen, for the solves the caller can send */
+   peach_cuda_track(P, bt);
 
    /* set cuda device */
    cuCHK(cudaSetDevice(ctx->id));
@@ -2389,7 +2476,9 @@ static int peach_solve_cuda_pipeline(DEVICE_CTX *ctx, const BTRAILER *bt,
             memcpy(P->map_phash, bt->phash, HASHLEN);
             if (++(P->epoch) == 0) P->epoch = 1;
             P->batches = 0;
-            P->alerted_diff = 0;
+            /* full batches again: a slowdown during the previous block
+             * must not shrink the batches of every later block */
+            P->nslots = P->cap;
             P->slow_batches = P->fast_batches = 0;
             /* update device phash */
             cuCHK(cudaMemcpy(P->d_phash, P->map_phash, HASHLEN,
@@ -2458,10 +2547,6 @@ static int peach_solve_cuda_pipeline(DEVICE_CTX *ctx, const BTRAILER *bt,
 
    /* solve work in block trailer */
    if (ctx->status == DEV_WORK) {
-      /* (0) after a pause, results in flight may belong to a trailer
-       * this solver never saw (several updates with the same phash):
-       * discard them rather than report a solve nobody can send */
-      if (stale) P->inflight[0] = P->inflight[1] = 0;
       for (id = 0; id < 2; id++) {
          err = cudaStreamQuery(P->stream[id]);
          if (err == cudaErrorNotReady) continue;
@@ -2488,9 +2573,11 @@ static int peach_solve_cuda_pipeline(DEVICE_CTX *ctx, const BTRAILER *bt,
             ctx->work = 0;
             break;
          }
-         /* (3) harvest the finished batch of this stream */
+         /* (3) harvest the finished batch of this stream; report its
+          * solve only if the caller can still send it */
          if (P->inflight[id]) {
-            rc = peach_cuda_harvest(ctx, P, id, btout);
+            rc = peach_cuda_harvest(ctx, P, id, btout,
+               peach_cuda_reportable(P, id));
             if (rc > 0) return VEOK;
             if (rc < 0) return VERROR;
          }
@@ -2517,8 +2604,9 @@ static int peach_solve_cuda_pipeline(DEVICE_CTX *ctx, const BTRAILER *bt,
  * @returns VEOK on solve, VERROR on no solve, or VETIMEOUT if GPU is
  * either stopped or unrecoverable.
  * @note @a bt may be updated by another thread meanwhile: the solver only
- * uses a consistent snapshot of it, taken on entry. A solve is written to
- * @a btout only after peach_checkhash() confirmed it on the CPU.
+ * uses a stable snapshot of it, taken on entry (best effort, see
+ * peach_cuda_snapshot()). A solve is written to @a btout only after
+ * peach_checkhash() confirmed it on the CPU.
  * @note Uses the pipeline solver when it was set up by
  * peach_init_cuda_device() and has not been abandoned after a defect
  * (see peach_pipeline_cuda_device()), else the official (legacy) solver.
@@ -2532,7 +2620,7 @@ int peach_solve_cuda(DEVICE_CTX *ctx, BTRAILER *bt, word8 diff, BTRAILER *btout)
    if (ctx->status < DEV_NULL) return VETIMEOUT;
    P = (PEACH_CUDA_CTX *) ctx->peach;
    if (P == NULL) return VETIMEOUT;
-   /* use ONLY a consistent snapshot of the (shared) block trailer */
+   /* use ONLY a (stable) snapshot of the (shared) block trailer */
    if (peach_cuda_snapshot(bt, &snap) != VEOK) {
       pdebug("CUDA #%d: block trailer is changing, retry later", ctx->id);
       return VERROR;
