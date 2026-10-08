@@ -839,31 +839,41 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
 }  /* end kcu_peach_pipe_init() */
 
 /**
- * Generate a hash kernel of the pipeline (all but MD2).
- * Kernel arguments: (PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b, int round),
- * round 0..7; consumes q[round & 1][ALGO], see peach_pipe_round().
+ * Generate a hash kernel of the pipeline (all but MD2) with launch
+ * bounds BOUNDS. Kernel arguments: (PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS
+ * b, int round), round 0..7; consumes queue (round, ALGO), see
+ * peach_pipe_round().
 */
-#define PEACH_PIPE_HASH_KERNEL(NAME, ALGO) \
-   PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK) \
+#define PEACH_PIPE_HASH_KERNEL(NAME, ALGO, BOUNDS) \
+   PEACH_KERNEL void BOUNDS \
       NAME(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b, int round) \
    { \
       peach_pipe_round(p, b, round, (ALGO), NULL); \
    }
 
+/* launch bounds of the hash kernels: SHA3/Keccak with at least 4
+ * resident blocks per SM (<= 128 registers, no spills): with the
+ * PEACH_LDGTILE() loads, sm_120 ptxas otherwise allocates 162 registers
+ * (3 blocks per SM, slower) */
+#define PEACH_PIPE_LB_DEFAULT  __launch_bounds__(PEACH_PIPE_BLOCK)
+#define PEACH_PIPE_LB_KECCAK   __launch_bounds__(PEACH_PIPE_BLOCK, 4)
+
 /** CUDA hash kernel, algo 0: Blake2b-256 keyed with 32 zero bytes. */
-PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_blake2b32, 0)
+PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_blake2b32, 0,
+   PEACH_PIPE_LB_DEFAULT)
 /** CUDA hash kernel, algo 1: Blake2b-256 keyed with 64 x 0x01. */
-PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_blake2b64, 1)
+PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_blake2b64, 1,
+   PEACH_PIPE_LB_DEFAULT)
 /** CUDA hash kernel, algo 2: SHA-1. */
-PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_sha1, 2)
+PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_sha1, 2, PEACH_PIPE_LB_DEFAULT)
 /** CUDA hash kernel, algo 3: SHA-256. */
-PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_sha256, 3)
+PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_sha256, 3, PEACH_PIPE_LB_DEFAULT)
 /** CUDA hash kernel, algo 4: SHA3-256. */
-PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_sha3, 4)
+PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_sha3, 4, PEACH_PIPE_LB_KECCAK)
 /** CUDA hash kernel, algo 5: Keccak-256. */
-PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_keccak, 5)
+PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_keccak, 5, PEACH_PIPE_LB_KECCAK)
 /** CUDA hash kernel, algo 7: MD5. */
-PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_md5, 7)
+PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_md5, 7, PEACH_PIPE_LB_DEFAULT)
 
 /**
  * CUDA hash kernel, algo 6: MD2. Stages the S-box in a 256-byte shared

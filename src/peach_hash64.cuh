@@ -7,7 +7,7 @@
  * `nonce (32 B) || m (4 B, little-endian) || tile[m] (1024 B)`,
  * computed from its parts without materializing the seed: the 8 nonce
  * words, the tile index m and the 16-byte aligned tile (64 x uint4,
- * every vector loaded exactly once with PEACH_LDG128()). The 64-bit
+ * every vector loaded exactly once with PEACH_LDGTILE()). The 64-bit
  * message lanes are paired from those words; the 1..3 words of a load
  * that cross a block boundary are carried into the next block.
  * <br />
@@ -73,7 +73,7 @@
 
 
 #include "extint.h"           /* for word types */
-#include "peach_compat.cuh"   /* for PEACH_DEV, PEACH_LDG128(), uint4 */
+#include "peach_compat.cuh"   /* for PEACH_DEV, PEACH_LDGTILE(), uint4 */
 
 /* keep the next loop rolled on device: one hash body per kernel
  * (the plain C build of the CPU emulation has nothing to unroll) */
@@ -204,12 +204,12 @@ PEACH_DEV void peach_sh_blake2b(const word32 *n, word32 index,
    for (k = 0; k < 9; k++) {
       if (k == 0) {
          /* seed words 0..31: nonce, index, tile words 0..22 */
-         q0 = PEACH_LDG128(&tile[0]);
-         q1 = PEACH_LDG128(&tile[1]);
-         q2 = PEACH_LDG128(&tile[2]);
-         q3 = PEACH_LDG128(&tile[3]);
-         q4 = PEACH_LDG128(&tile[4]);
-         q5 = PEACH_LDG128(&tile[5]);
+         q0 = PEACH_LDGTILE(&tile[0]);
+         q1 = PEACH_LDGTILE(&tile[1]);
+         q2 = PEACH_LDGTILE(&tile[2]);
+         q3 = PEACH_LDGTILE(&tile[3]);
+         q4 = PEACH_LDGTILE(&tile[4]);
+         q5 = PEACH_LDGTILE(&tile[5]);
          m0 = PEACH_H64_LANE(n[0], n[1]);
          m1 = PEACH_H64_LANE(n[2], n[3]);
          m2 = PEACH_H64_LANE(n[4], n[5]);
@@ -232,14 +232,14 @@ PEACH_DEV void peach_sh_blake2b(const word32 *n, word32 index,
       } else if (k < 8) {
          /* seed words 32k..32k+31: tile words 32k-9..32k+22 */
          tp = &tile[(8 * k) - 2];
-         q0 = PEACH_LDG128(&tp[0]);
-         q1 = PEACH_LDG128(&tp[1]);
-         q2 = PEACH_LDG128(&tp[2]);
-         q3 = PEACH_LDG128(&tp[3]);
-         q4 = PEACH_LDG128(&tp[4]);
-         q5 = PEACH_LDG128(&tp[5]);
-         q6 = PEACH_LDG128(&tp[6]);
-         q7 = PEACH_LDG128(&tp[7]);
+         q0 = PEACH_LDGTILE(&tp[0]);
+         q1 = PEACH_LDGTILE(&tp[1]);
+         q2 = PEACH_LDGTILE(&tp[2]);
+         q3 = PEACH_LDGTILE(&tp[3]);
+         q4 = PEACH_LDGTILE(&tp[4]);
+         q5 = PEACH_LDGTILE(&tp[5]);
+         q6 = PEACH_LDGTILE(&tp[6]);
+         q7 = PEACH_LDGTILE(&tp[7]);
          m0 = PEACH_H64_LANE(carry, q0.x);
          m1 = PEACH_H64_LANE(q0.y, q0.z);
          m2 = PEACH_H64_LANE(q0.w, q1.x);
@@ -261,8 +261,8 @@ PEACH_DEV void peach_sh_blake2b(const word32 *n, word32 index,
          f = 0;
       } else {
          /* seed words 256..264: tile words 247..255, zero padded */
-         q0 = PEACH_LDG128(&tile[62]);
-         q1 = PEACH_LDG128(&tile[63]);
+         q0 = PEACH_LDGTILE(&tile[62]);
+         q1 = PEACH_LDGTILE(&tile[63]);
          m0 = PEACH_H64_LANE(carry, q0.x);
          m1 = PEACH_H64_LANE(q0.y, q0.z);
          m2 = PEACH_H64_LANE(q0.w, q1.x);
@@ -618,13 +618,13 @@ PEACH_DEV void peach_sh_keccak_pad(const word32 *n, word32 index,
    for (k = 0; k < 8; k++) {
       if (k == 0) {
          /* seed words 0..33: nonce, index, tile words 0..24 */
-         q0 = PEACH_LDG128(&tile[0]);
-         q1 = PEACH_LDG128(&tile[1]);
-         q2 = PEACH_LDG128(&tile[2]);
-         q3 = PEACH_LDG128(&tile[3]);
-         q4 = PEACH_LDG128(&tile[4]);
-         q5 = PEACH_LDG128(&tile[5]);
-         q6 = PEACH_LDG128(&tile[6]);
+         q0 = PEACH_LDGTILE(&tile[0]);
+         q1 = PEACH_LDGTILE(&tile[1]);
+         q2 = PEACH_LDGTILE(&tile[2]);
+         q3 = PEACH_LDGTILE(&tile[3]);
+         q4 = PEACH_LDGTILE(&tile[4]);
+         q5 = PEACH_LDGTILE(&tile[5]);
+         q6 = PEACH_LDGTILE(&tile[6]);
          st[0] ^= PEACH_H64_LANE(n[0], n[1]);
          st[1] ^= PEACH_H64_LANE(n[2], n[3]);
          st[2] ^= PEACH_H64_LANE(n[4], n[5]);
@@ -645,12 +645,12 @@ PEACH_DEV void peach_sh_keccak_pad(const word32 *n, word32 index,
          c0 = q6.y; c1 = q6.z; c2 = q6.w;
       } else if (k == 7) {
          /* seed words 238..264: tile words 229..255, then padding */
-         q0 = PEACH_LDG128(&tile[58]);
-         q1 = PEACH_LDG128(&tile[59]);
-         q2 = PEACH_LDG128(&tile[60]);
-         q3 = PEACH_LDG128(&tile[61]);
-         q4 = PEACH_LDG128(&tile[62]);
-         q5 = PEACH_LDG128(&tile[63]);
+         q0 = PEACH_LDGTILE(&tile[58]);
+         q1 = PEACH_LDGTILE(&tile[59]);
+         q2 = PEACH_LDGTILE(&tile[60]);
+         q3 = PEACH_LDGTILE(&tile[61]);
+         q4 = PEACH_LDGTILE(&tile[62]);
+         q5 = PEACH_LDGTILE(&tile[63]);
          st[0] ^= PEACH_H64_LANE(c0, c1);
          st[1] ^= PEACH_H64_LANE(c2, q0.x);
          st[2] ^= PEACH_H64_LANE(q0.y, q0.z);
@@ -670,14 +670,14 @@ PEACH_DEV void peach_sh_keccak_pad(const word32 *n, word32 index,
       } else if (k & 1) {
          /* seed words 34k..34k+33: tile words 34k-9..34k+24 */
          tp = &tile[(17 * (k >> 1)) + 7];
-         q0 = PEACH_LDG128(&tp[0]);
-         q1 = PEACH_LDG128(&tp[1]);
-         q2 = PEACH_LDG128(&tp[2]);
-         q3 = PEACH_LDG128(&tp[3]);
-         q4 = PEACH_LDG128(&tp[4]);
-         q5 = PEACH_LDG128(&tp[5]);
-         q6 = PEACH_LDG128(&tp[6]);
-         q7 = PEACH_LDG128(&tp[7]);
+         q0 = PEACH_LDGTILE(&tp[0]);
+         q1 = PEACH_LDGTILE(&tp[1]);
+         q2 = PEACH_LDGTILE(&tp[2]);
+         q3 = PEACH_LDGTILE(&tp[3]);
+         q4 = PEACH_LDGTILE(&tp[4]);
+         q5 = PEACH_LDGTILE(&tp[5]);
+         q6 = PEACH_LDGTILE(&tp[6]);
+         q7 = PEACH_LDGTILE(&tp[7]);
          st[0] ^= PEACH_H64_LANE(c0, c1);
          st[1] ^= PEACH_H64_LANE(c2, q0.x);
          st[2] ^= PEACH_H64_LANE(q0.y, q0.z);
@@ -699,15 +699,15 @@ PEACH_DEV void peach_sh_keccak_pad(const word32 *n, word32 index,
       } else {
          /* seed words 34k..34k+33: tile words 34k-9..34k+24 */
          tp = &tile[(17 * (k >> 1)) - 2];
-         q0 = PEACH_LDG128(&tp[0]);
-         q1 = PEACH_LDG128(&tp[1]);
-         q2 = PEACH_LDG128(&tp[2]);
-         q3 = PEACH_LDG128(&tp[3]);
-         q4 = PEACH_LDG128(&tp[4]);
-         q5 = PEACH_LDG128(&tp[5]);
-         q6 = PEACH_LDG128(&tp[6]);
-         q7 = PEACH_LDG128(&tp[7]);
-         q8 = PEACH_LDG128(&tp[8]);
+         q0 = PEACH_LDGTILE(&tp[0]);
+         q1 = PEACH_LDGTILE(&tp[1]);
+         q2 = PEACH_LDGTILE(&tp[2]);
+         q3 = PEACH_LDGTILE(&tp[3]);
+         q4 = PEACH_LDGTILE(&tp[4]);
+         q5 = PEACH_LDGTILE(&tp[5]);
+         q6 = PEACH_LDGTILE(&tp[6]);
+         q7 = PEACH_LDGTILE(&tp[7]);
+         q8 = PEACH_LDGTILE(&tp[8]);
          st[0] ^= PEACH_H64_LANE(c0, q0.x);
          st[1] ^= PEACH_H64_LANE(q0.y, q0.z);
          st[2] ^= PEACH_H64_LANE(q0.w, q1.x);

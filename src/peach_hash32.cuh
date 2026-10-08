@@ -38,7 +38,7 @@
 
 #include "extint.h"           /* for word types */
 #include "peach.h"            /* for PEACHJUMPLEN, PEACHTILELEN */
-#include "peach_compat.cuh"   /* for PEACH_DEV, PEACH_LDG128, rotates */
+#include "peach_compat.cuh"   /* for PEACH_DEV, PEACH_LDGTILE, rotates */
 
 /* loop that must not be unrolled on the device (instruction cache) */
 #ifdef __CUDA_ARCH__
@@ -333,8 +333,8 @@ PEACH_DEV word32 peach_hash32_view0(word32 *w, const word32 *n, word32 m,
 {
    uint4 v0, v1;
 
-   v0 = PEACH_LDG128(&tile[0]);
-   v1 = PEACH_LDG128(&tile[1]);
+   v0 = PEACH_LDGTILE(&tile[0]);
+   v1 = PEACH_LDGTILE(&tile[1]);
    w[0] = peach_hash32_order(n[0], be);
    w[1] = peach_hash32_order(n[1], be);
    w[2] = peach_hash32_order(n[2], be);
@@ -372,10 +372,10 @@ PEACH_DEV word32 peach_hash32_viewk(word32 *w, word32 carry,
    const uint4 *t = &tile[(4 * k) - 2];
    uint4 v0, v1, v2, v3;
 
-   v0 = PEACH_LDG128(&t[0]);
-   v1 = PEACH_LDG128(&t[1]);
-   v2 = PEACH_LDG128(&t[2]);
-   v3 = PEACH_LDG128(&t[3]);
+   v0 = PEACH_LDGTILE(&t[0]);
+   v1 = PEACH_LDGTILE(&t[1]);
+   v2 = PEACH_LDGTILE(&t[2]);
+   v3 = PEACH_LDGTILE(&t[3]);
    w[0] = peach_hash32_order(carry, be);
    w[1] = peach_hash32_order(v0.x, be);
    w[2] = peach_hash32_order(v0.y, be);
@@ -411,8 +411,8 @@ PEACH_DEV void peach_hash32_view16(word32 *w, word32 carry,
 {
    uint4 v0, v1;
 
-   v0 = PEACH_LDG128(&tile[62]);
-   v1 = PEACH_LDG128(&tile[63]);
+   v0 = PEACH_LDGTILE(&tile[62]);
+   v1 = PEACH_LDGTILE(&tile[63]);
    w[0] = peach_hash32_order(carry, be);
    w[1] = peach_hash32_order(v0.x, be);
    w[2] = peach_hash32_order(v0.y, be);
@@ -439,7 +439,7 @@ PEACH_DEV void peach_hash32_view16(word32 *w, word32 carry,
  * SHA-1 of the jump seed view (Nighthash algorithm 2).
  * @param n Nonce (8 words)
  * @param m Tile index (seed word 8)
- * @param tile Tile m (64 x uint4, 16-byte aligned, read with __ldg)
+ * @param tile Tile m (64 x uint4, 16-byte aligned, PEACH_LDGTILE())
  * @param out 8 words as peach_nighthash() (words 5..7 are zero)
 */
 PEACH_DEV void peach_sh_sha1(const word32 *n, word32 m, const uint4 *tile,
@@ -476,7 +476,7 @@ PEACH_DEV void peach_sh_sha1(const word32 *n, word32 m, const uint4 *tile,
  * SHA-256 of the jump seed view (Nighthash algorithm 3).
  * @param n Nonce (8 words)
  * @param m Tile index (seed word 8)
- * @param tile Tile m (64 x uint4, 16-byte aligned, read with __ldg)
+ * @param tile Tile m (64 x uint4, 16-byte aligned, PEACH_LDGTILE())
  * @param out 8 words as peach_nighthash()
 */
 PEACH_DEV void peach_sh_sha256(const word32 *n, word32 m, const uint4 *tile,
@@ -509,7 +509,7 @@ PEACH_DEV void peach_sh_sha256(const word32 *n, word32 m, const uint4 *tile,
  * MD5 of the jump seed view (Nighthash algorithm 7).
  * @param n Nonce (8 words)
  * @param m Tile index (seed word 8)
- * @param tile Tile m (64 x uint4, 16-byte aligned, read with __ldg)
+ * @param tile Tile m (64 x uint4, 16-byte aligned, PEACH_LDGTILE())
  * @param out 8 words as peach_nighthash() (words 4..7 are zero)
 */
 PEACH_DEV void peach_sh_md5(const word32 *n, word32 m, const uint4 *tile,
@@ -606,10 +606,10 @@ PEACH_DEV void peach_hash32_load64(word32 *w, const uint4 *t)
 {
    uint4 v0, v1, v2, v3;
 
-   v0 = PEACH_LDG128(&t[0]);
-   v1 = PEACH_LDG128(&t[1]);
-   v2 = PEACH_LDG128(&t[2]);
-   v3 = PEACH_LDG128(&t[3]);
+   v0 = PEACH_LDGTILE(&t[0]);
+   v1 = PEACH_LDGTILE(&t[1]);
+   v2 = PEACH_LDGTILE(&t[2]);
+   v3 = PEACH_LDGTILE(&t[3]);
    w[0] = peach_bswap32(v0.x); w[1] = peach_bswap32(v0.y);
    w[2] = peach_bswap32(v0.z); w[3] = peach_bswap32(v0.w);
    w[4] = peach_bswap32(v1.x); w[5] = peach_bswap32(v1.y);
@@ -626,7 +626,7 @@ PEACH_DEV void peach_hash32_load64(word32 *w, const uint4 *t)
  * block 16 = t[62], t[63] (tile bytes 992..1023) || 0x80 || zeros ||
  * be64(8448).
  * @param hash0 SHA-256 of bt[0..123] as 8 little-endian words
- * @param tile Final tile (64 x uint4, 16-byte aligned, read with __ldg)
+ * @param tile Final tile (64 x uint4, 16-byte aligned, PEACH_LDGTILE())
  * @param out Digest as 8 little-endian words (word i = bytes 4i..4i+3)
 */
 PEACH_DEV void peach_sha256_final(const word32 hash0[8], const uint4 *tile,
@@ -637,8 +637,8 @@ PEACH_DEV void peach_sha256_final(const word32 hash0[8], const uint4 *tile,
    int k;
 
    peach_sha256_iv(st);
-   v0 = PEACH_LDG128(&tile[0]);
-   v1 = PEACH_LDG128(&tile[1]);
+   v0 = PEACH_LDGTILE(&tile[0]);
+   v1 = PEACH_LDGTILE(&tile[1]);
    w[0] = peach_bswap32(hash0[0]);
    w[1] = peach_bswap32(hash0[1]);
    w[2] = peach_bswap32(hash0[2]);
@@ -657,8 +657,8 @@ PEACH_DEV void peach_sha256_final(const word32 hash0[8], const uint4 *tile,
       peach_hash32_load64(w, &tile[(4 * k) - 2]);
       peach_sha256_compress(st, w);
    }
-   v0 = PEACH_LDG128(&tile[62]);
-   v1 = PEACH_LDG128(&tile[63]);
+   v0 = PEACH_LDGTILE(&tile[62]);
+   v1 = PEACH_LDGTILE(&tile[63]);
    w[0] = peach_bswap32(v0.x); w[1] = peach_bswap32(v0.y);
    w[2] = peach_bswap32(v0.z); w[3] = peach_bswap32(v0.w);
    w[4] = peach_bswap32(v1.x); w[5] = peach_bswap32(v1.y);
