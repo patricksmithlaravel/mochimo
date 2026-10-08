@@ -9,11 +9,11 @@
  * <br />GPU only; without a usable CUDA device the test is skipped
  * (exit 0). For each configuration, one CUDA device is initialized with
  * peach_init_cuda_device() under that configuration's environment
- * (MCM_PEACH_LEGACY, MCM_PEACH_SKIP, MCM_PEACH_BATCH), the Peach map is
- * built (with the transition table and self-test of the pipeline), and the
- * solver runs for a fixed time on the same block trailer at a moderate
- * difficulty. Every reported solve must belong to that trailer and pass
- * peach_check(). The solver in use is checked with
+ * (MCM_PEACH_LEGACY, MCM_PEACH_SKIP, MCM_PEACH_BATCH, MCM_PEACH_STREAMS),
+ * the Peach map is built (with the transition table and self-test of the
+ * pipeline), and the solver runs for a fixed time on the same block
+ * trailer at a moderate difficulty. Every reported solve must belong to
+ * that trailer and pass peach_check(). The solver in use is checked with
  * peach_pipeline_cuda_device() after initialization, after the map build
  * and after solving: a pipeline configuration fails if the device uses
  * the legacy solver (failed pipeline setup, or a fallback after a self-
@@ -22,9 +22,10 @@
  * nonces per second (work counted by the solver over the solving time)
  * and the speedup over the legacy solver. Configurations: legacy,
  * pipeline (defaults), then pipeline variants: full evaluation (skip
- * mask 0), mixed per-round skip masks, a wider skip mask, and the
- * smallest batch size. Time bounded: map build <= 300 s, solving as
- * below.
+ * mask 0), mixed per-round skip masks, a wider skip mask, the smallest
+ * batch size, and two batch contexts (streams) with the default and the
+ * full evaluation skip masks. Time bounded: map build <= 300 s, solving
+ * as below.
  * <br />
  * Optional environment:
  * - PEACH_GPUAB_SECONDS: solving time per configuration (default 20,
@@ -33,6 +34,8 @@
  * - PEACH_GPUAB_DEVICE: CUDA device index (default 0)
  * - PEACH_GPUAB_SWEEP=0: skip the pipeline variants (default 1)
  * - PEACH_GPUAB_DEBUG=1: debug logging (e.g. pipeline batch sizing)
+ * - PEACH_GPUAB_POLL_MS: milliseconds between two solver calls (default
+ *   1; gpuminer polls every 10 ms by default)
 */
 
 #include <stdio.h>
@@ -84,17 +87,20 @@ typedef struct {
    const char *legacy;  /* MCM_PEACH_LEGACY */
    const char *skip;    /* MCM_PEACH_SKIP, or NULL (unset: default) */
    const char *batch;   /* MCM_PEACH_BATCH, or NULL (unset: automatic) */
+   const char *streams; /* MCM_PEACH_STREAMS, or NULL (unset: automatic) */
    int sweep;           /* pipeline variant (skipped with SWEEP=0) */
 } GPUAB_CONFIG;
 
 static const GPUAB_CONFIG Config[] = {
-   { "legacy", "1", NULL, NULL, 0 },
-   { "pipeline", "0", NULL, NULL, 0 },
-   { "pipeline skip=0x00", "0", "0", NULL, 1 },
+   { "legacy", "1", NULL, NULL, NULL, 0 },
+   { "pipeline", "0", NULL, NULL, NULL, 0 },
+   { "pipeline skip=0x00", "0", "0", NULL, NULL, 1 },
    { "pipeline skip=0x00,0x40x7", "0",
-      "0,0x40,0x40,0x40,0x40,0x40,0x40,0x40", NULL, 1 },
-   { "pipeline skip=0x70", "0", "0x70", NULL, 1 },
-   { "pipeline batch=min", "0", NULL, "1", 1 }
+      "0,0x40,0x40,0x40,0x40,0x40,0x40,0x40", NULL, NULL, 1 },
+   { "pipeline skip=0x70", "0", "0x70", NULL, NULL, 1 },
+   { "pipeline batch=min", "0", NULL, "1", NULL, 1 },
+   { "pipeline streams=2", "0", NULL, NULL, "2", 1 },
+   { "pipeline skip=0x00 streams=2", "0", "0", NULL, "2", 1 }
 };
 
 #define NCONFIG   ((int) (sizeof(Config) / sizeof(Config[0])))
@@ -155,7 +161,7 @@ static int check_solver(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
  * @returns completed nonces per second, or a negative value on failure
 */
 static double run_config(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
-   const BTRAILER *bt_in, double seconds)
+   const BTRAILER *bt_in, double seconds, word32 poll_ms)
 {
    BTRAILER bt, btout;
    double t0, tstart, elapsed, build, rate, expect;
@@ -168,6 +174,8 @@ static double run_config(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
    else unsetenv("MCM_PEACH_SKIP");
    if (cfg->batch) setenv("MCM_PEACH_BATCH", cfg->batch, 1);
    else unsetenv("MCM_PEACH_BATCH");
+   if (cfg->streams) setenv("MCM_PEACH_STREAMS", cfg->streams, 1);
+   else unsetenv("MCM_PEACH_STREAMS");
 
    /* fresh trailer: not expired, not solved (btout bnum differs) */
    memcpy(&bt, bt_in, sizeof(bt));
@@ -175,9 +183,10 @@ static double run_config(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
    memset(&btout, 0, sizeof(btout));
 
    printf("== %s (MCM_PEACH_LEGACY=%s MCM_PEACH_SKIP=%s"
-      " MCM_PEACH_BATCH=%s)\n", cfg->name, cfg->legacy,
-      cfg->skip ? cfg->skip : "<default>",
-      cfg->batch ? cfg->batch : "<auto>");
+      " MCM_PEACH_BATCH=%s MCM_PEACH_STREAMS=%s)\n", cfg->name,
+      cfg->legacy, cfg->skip ? cfg->skip : "<default>",
+      cfg->batch ? cfg->batch : "<auto>",
+      cfg->streams ? cfg->streams : "<auto>");
    fflush(stdout);
    if (peach_init_cuda_device(dev) != VEOK) {
       printf("FAIL: peach_init_cuda_device()\n");
@@ -248,7 +257,7 @@ static double run_config(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
          ok = 0;
          break;
       }
-      millisleep(1);
+      millisleep(poll_ms);
    }
    /* a pipeline defect would have switched to the legacy solver */
    if (ok) ok = check_solver(dev, cfg, "after solving");
@@ -284,7 +293,7 @@ int main(void)
    BTRAILER bt;
    double rate[NCONFIG], seconds;
    cudaError_t err;
-   word32 seed;
+   word32 seed, poll_ms;
    int count, devidx, i, sweep, fails;
    long diff;
 
@@ -308,6 +317,7 @@ int main(void)
    diff = env_long("PEACH_GPUAB_DIFF", DEF_DIFF, 8, 48);
    devidx = (int) env_long("PEACH_GPUAB_DEVICE", 0, 0, GPUMAX - 1);
    sweep = (int) env_long("PEACH_GPUAB_SWEEP", 1, 0, 1);
+   poll_ms = (word32) env_long("PEACH_GPUAB_POLL_MS", 1, 1, 1000);
    if (env_long("PEACH_GPUAB_DEBUG", 0, 0, 1)) setploglevel(PLOG_DEBUG);
 
    memset(D, 0, sizeof(D));
@@ -317,8 +327,9 @@ int main(void)
          devidx, count);
       return 0;
    }
-   printf("GPU A/B: device %d: %s; difficulty %ld; %.0f s per config\n",
-      devidx, D[devidx].info, diff, seconds);
+   printf("GPU A/B: device %d: %s; difficulty %ld; %.0f s per config;"
+      " polls %lu ms apart\n", devidx, D[devidx].info, diff, seconds,
+      (unsigned long) poll_ms);
 
    seed = (word32) time(NULL);
    srand16(seed, seed ^ 0x5a5a5a5a, seed ^ 0xa5a5a5a5);
@@ -329,7 +340,7 @@ int main(void)
    for (i = 0; i < NCONFIG; i++) {
       rate[i] = 0.0;
       if (Config[i].sweep && !sweep) continue;
-      rate[i] = run_config(&D[devidx], &Config[i], &bt, seconds);
+      rate[i] = run_config(&D[devidx], &Config[i], &bt, seconds, poll_ms);
       if (rate[i] < 0.0) fails++;
    }
 
