@@ -891,22 +891,20 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
       peach_pipe_round(p, b, round, (ALGO), NULL, NULL); \
    }
 
-/* launch bounds of the hash kernels. SHA3/Keccak are close to 128
- * registers per thread, and the bound that ptxas meets without spills
- * depends on the architecture and on the CUDA version (checked with
- * CUDA 12.8 and 12.9; the ptxas gate checks the version CI uses):
- * - sm_120: 4 blocks per SM with CUDA 12.8 (122 registers; on an RTX
- *   5090 about 3% faster with the default skip masks than 3 blocks);
- *   with CUDA 12.9 a 4-block bound, or none, spilled, so 3 blocks (162
- *   registers); a 5-block bound fits too with CUDA 12.8 (96 registers),
- *   but not on sm_86, sm_89, sm_90 or for compute_52 PTX;
- * - sm_100 and sm_101: 3 blocks per SM with CUDA 12.8 (162 registers);
- *   with CUDA 12.9 that bound spilled, so none (138 registers, also 3
- *   blocks per SM);
- * - older targets: 4 blocks per SM (108-115 registers with or without
- *   it), as a guard.
- * The CUDA 12.9 figures predate the 32-bit-half Keccak-f of
- * peach_hash64.cuh, which needs fewer registers with CUDA 12.8.
+/* SHA3/Keccak launch bounds depend on the architecture and CUDA version.
+ * The current kernels pass the full ptxas gate without stack frames or
+ * spills with these chosen bounds (CUDA 12.8 and 12.9.1):
+ * - sm_120: 4 blocks per SM with CUDA 12.8 (122 registers), 3 blocks
+ *   with CUDA 12.9.1 (160 registers);
+ * - sm_100: 3 blocks per SM with CUDA 12.8 (162 registers), no minimum
+ *   block bound with CUDA 12.9.1 (128 registers); sm_101 uses the same
+ *   bounds, but the gate checks sm_100;
+ * - older targets: 4 blocks per SM (108-115 registers), as a guard.
+ * Earlier tuning, before the 32-bit-half rewrite, measured about 3%
+ * more throughput from 4 rather than 3 blocks on sm_120 with CUDA 12.8
+ * and found spills with alternative bounds on CUDA 12.9. Those are
+ * historical comparisons; the current gates validate the chosen bounds
+ * without remeasuring alternative-bound performance.
  * Host code launches these kernels with PEACH_PIPE_BLOCK threads only. */
 #define PEACH_PIPE_LB_DEFAULT  __launch_bounds__(PEACH_PIPE_BLOCK)
 #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 12 || \
@@ -947,11 +945,11 @@ PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_md5, 7, PEACH_PIPE_LB_DEFAULT)
  * table (data dependent lookups; constant memory would serialize them)
  * before the block-uniform loop of peach_pipe_round().
  * <br />
- * Its 64 state and checksum byte registers leave it needing 84..90
- * registers; without an occupancy target ptxas squeezes it into 80 (6
- * blocks of 128 threads per 64K-register SM) with stack spills on some
- * architectures. The target of 5 blocks per SM (at most 102 registers)
- * is a bound it meets without spills, not a register cap.
+ * The current kernel uses 86..96 registers across the CUDA 12.8 and
+ * 12.9.1 gate targets, with no stack frames or spills. Earlier tuning
+ * without an occupancy target fitted the prior kernel into 80 registers
+ * with stack spills on some architectures. The retained target of
+ * 5 blocks per SM is an occupancy constraint, not a register cap.
  * @param p Batch parameters
  * @param b Batch buffers
  * @param round Round number, 0..7
