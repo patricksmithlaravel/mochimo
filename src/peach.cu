@@ -47,10 +47,11 @@
 
 /* Pipeline batch sizing (see peach_cuda_sizing()) */
 #define PEACH_CUDA_NCTX             2  /**< batch contexts (streams) */
-#define PEACH_CUDA_SLOT_BYTES       ( sizeof(PEACH_PIPE_SLOT) + \
-   8 * sizeof(word32) + sizeof(word64) + \
+#define PEACH_CUDA_SLOT_BYTES       ( 2 * sizeof(PEACH_PIPE_SLOT) + \
+   8 * sizeof(word32) + sizeof(word64) + sizeof(word32) + \
    PEACH_PIPE_NQUEUE * sizeof(word32) )   /**< device bytes per slot and
-   context: slot 32 + hash0 32 + rng 8 + 17 queues x 4 = 140 */
+   context: slot state 16 + queue entry 16 + hash0 32 + rng 8 + key 4 +
+   8 round 0 queues x 4 = 108 */
 #define PEACH_CUDA_SLOTS_PER_THREAD 32 /**< default slots per resident
    thread (N = 32 x SMs x maxThreadsPerSM) */
 #define PEACH_CUDA_MEM_PERCENT      80 /**< max. share of free memory used
@@ -1290,7 +1291,9 @@ static cudaError_t peach_cuda_pipeline_release(DEVICE_CTX *ctx,
       if (P->bufs[id].d_slot) cuFREE(cudaFree(P->bufs[id].d_slot));
       if (P->bufs[id].d_hash) cuFREE(cudaFree(P->bufs[id].d_hash));
       if (P->bufs[id].d_q) cuFREE(cudaFree(P->bufs[id].d_q));
+      if (P->bufs[id].d_ent) cuFREE(cudaFree(P->bufs[id].d_ent));
       if (P->bufs[id].d_cnt) cuFREE(cudaFree(P->bufs[id].d_cnt));
+      if (P->bufs[id].d_key) cuFREE(cudaFree(P->bufs[id].d_key));
       if (P->bufs[id].d_res) cuFREE(cudaFree(P->bufs[id].d_res));
       if (P->bufs[id].d_trace) cuFREE(cudaFree(P->bufs[id].d_trace));
       /* (bufs[id].d_map and bufs[id].d_T alias P->d_map and P->d_T) */
@@ -1365,7 +1368,8 @@ static int peach_cuda_pipeline_setup(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
 
    /* batch size (sets P->sms, cap, nslots, nslots_min) */
    if (peach_cuda_sizing(ctx, P, PEACH_CUDA_T_BYTES +
-         PEACH_CUDA_SELFTEST_BYTES) != VEOK) {
+         PEACH_CUDA_SELFTEST_BYTES + (PEACH_CUDA_NCTX *
+         PEACH_PIPE_CNTWORDS * sizeof(word32))) != VEOK) {
       return VERROR;
    }
    if (P->cap < PEACH_PIPE_BLOCK || (P->cap % PEACH_PIPE_BLOCK) != 0 ||
@@ -1395,8 +1399,11 @@ static int peach_cuda_pipeline_setup(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
       cuTRY(cudaMalloc((void **) &(b->d_hash), cap * 8 * sizeof(word32)));
       cuTRY(cudaMalloc((void **) &(b->d_q),
          cap * PEACH_PIPE_NQUEUE * sizeof(word32)));
+      cuTRY(cudaMalloc((void **) &(b->d_ent),
+         cap * sizeof(PEACH_PIPE_SLOT)));
       cuTRY(cudaMalloc((void **) &(b->d_cnt),
-         PEACH_PIPE_NCNT * PEACH_PIPE_CNTPAD * sizeof(word32)));
+         PEACH_PIPE_CNTWORDS * sizeof(word32)));
+      cuTRY(cudaMalloc((void **) &(b->d_key), cap * sizeof(word32)));
       cuTRY(cudaMalloc((void **) &(b->d_res), sizeof(PEACH_PIPE_RESULT)));
       cuTRY(cudaMallocHost((void **) &(P->h_res[id]),
          sizeof(PEACH_PIPE_RESULT)));

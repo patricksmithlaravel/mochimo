@@ -11,7 +11,8 @@
  * with their transition table entries (computed by the transitions
  * kernel). Checks:
  * (0) helpers: peach_pipe_diff_ok() vs trigg_eval() for every difficulty
- *     and leading zero count, skip mask packing, enqueue argument
+ *     and leading zero count, peach_pipe_frame() vs the official nonce
+ *     frame for every table index, skip mask packing, enqueue argument
  *     validation (nothing enqueued), the self-test kernel vs reference
  *     dflops steps, the transitions kernel vs peach_transition_tile()
  *     incl. adversarial words and range clamping at the end of the map;
@@ -31,9 +32,19 @@
  *     test with random nonzero tile indices (T and jumps off tile 0),
  *     then the hash and final kernels, vs the reference walk;
  * (4) small queue capacity (cap < nslots, full evaluation): appends past
- *     cap in a round-0 queue and in the final queue are counted, lost
- *     slots are marked, consumers stop at cap, everything else stays
- *     exact.
+ *     cap in a round-0 queue and entries past cap in the packed queues of
+ *     a later round are counted, lost slots are marked, consumers stop at
+ *     cap, everything else stays exact;
+ * (5) tile sort kernels (scan, scatter) on random keys with hot and edge
+ *     buckets, dead keys and several launch shapes: queue counters, every
+ *     queue (packed at its offset) a tile ordered set of its slots'
+ *     entries, cursors at the bucket ends; with a small capacity, the
+ *     entries past cap counted as overflow, their keys killed and their
+ *     slots marked lost.
+ * Every batch check (2)-(4) also checks the final queue's entries (tile
+ * order, states of the completed slots) and every slot's final key; the
+ * per-kernel runs of (2), (3) and (4) check the tile ordered queues of
+ * every round right after their sort.
  * OpenMP is used for reference work only (never around emulated kernels).
 */
 
@@ -333,31 +344,17 @@ static int words_eq(const word32 *a, const word32 *b, int n)
    return memcmp(a, b, (size_t) n * 4) == 0;
 }
 
-/* launch a batch with the per-kernel launches of peach_pipe_enqueue()
- * (used where the enqueue argument checks or its init do not apply) */
-static void launch_rounds(const PEACH_PIPE_PARAMS *p,
-   const PEACH_PIPE_BUFS *b, const PEACH_PIPE_LAUNCH *l, int with_init)
+/* slot state (or queue entry) e == the reference state of slot R[k] in
+ * round r: frame random number giving its nonce words 4..7, tile of
+ * round r with P & 7, slot number k */
+static int state_eq(const PEACH_PIPE_SLOT *e, const REFSLOT *R, word32 k,
+   int r)
 {
-   word32 mask;
-   int r, a;
+   word32 fr[4];
 
-   if (with_init) {
-      memset(b->d_cnt, 0, sizeof(word32) * PEACH_PIPE_NCNT *
-         PEACH_PIPE_CNTPAD);
-      memset(b->d_res, 0, sizeof(PEACH_PIPE_RESULT));
-      CUDA_KERNEL(kcu_peach_pipe_init, l->grid_init, l->block, 0, NULL)
-         (*p, *b);
-   }
-   for (r = 0; r < PEACHROUNDS; r++) {
-      mask = peach_pipe_skip_mask(p->skip, (word32) r);
-      for (a = 0; a < 8; a++) {
-         if ((mask >> a) & 1) continue;
-         peach_pipe_launch_hash(a, l->grid_hash[a], l->block, NULL, p, b,
-            r);
-      }
-   }
-   CUDA_KERNEL(kcu_peach_pipe_final, l->grid_final, l->block, 0, NULL)
-      (*p, *b);
+   frame_words(((word64) e->seed[1] << 32) | e->seed[0], fr);
+   return words_eq(fr, &R[k].nonce[4], 4) && e->id == k &&
+      e->tile == (R[k].mario[r] | ((R[k].p & 7) << PEACH_PIPE_PSHIFT));
 }
 
 /* fill the batch buffers with garbage (every read must be preceded by
@@ -367,11 +364,102 @@ static void scramble_buffers(word32 cap)
    memset(Bufs.d_slot, 0xA5, sizeof(PEACH_PIPE_SLOT) * CAP);
    memset(Bufs.d_hash, 0xA5, sizeof(word32) * 8 * CAP);
    memset(Bufs.d_q, 0xA5, sizeof(word32) * PEACH_PIPE_NQUEUE * CAP);
-   memset(Bufs.d_cnt, 0xA5, sizeof(word32) * PEACH_PIPE_NCNT *
-      PEACH_PIPE_CNTPAD);
+   memset(Bufs.d_ent, 0xA5, sizeof(PEACH_PIPE_SLOT) * CAP);
+   memset(Bufs.d_cnt, 0xA5, sizeof(word32) * PEACH_PIPE_CNTWORDS);
+   memset(Bufs.d_key, 0xA5, sizeof(word32) * CAP);
    memset(Bufs.d_res, 0xA5, sizeof(PEACH_PIPE_RESULT));
    memset(Bufs.d_trace, 0xEE, sizeof(PEACH_PIPE_TRACE) * CAP);
    Bufs.cap = cap;
+}
+
+/* the tile ordered queues of round r (1..7; 8: the final queue) right
+ * after their sort (the final queue also after the batch): queue a at
+ * off(r, a), its stored entries are the states (frame random number:
+ * nonce words 4..7, tile of round r, P & 7) of distinct slots < count
+ * that use algo a in round r (any algo for the final queue), in
+ * ascending tile bucket order; and (unless lost_ok) exactly the slots
+ * that reach round r */
+static void check_round_queues(const CFG *c, const REFSLOT *R, int count,
+   int r)
+{
+   static word8 seen[CAP];
+   const PEACH_PIPE_SLOT *e;
+   word32 want[8], cnt, off, n, i, slot, bk, prev, cap = Bufs.cap;
+   char msg[96];
+   int a, d, k, nq = r < PEACHROUNDS ? 8 : 1;
+
+   memset(seen, 0, sizeof(seen));
+   memset(want, 0, sizeof(want));
+   for (k = 0; k < count; k++) {
+      d = drop_round_of(&R[k], c->masks);
+      if (d > r || d == PEACHROUNDS) want[r < PEACHROUNDS ? R[k].algo[r] : 0]++;
+   }
+   for (off = 0, a = 0; a < nq; a++, off += cnt) {
+      cnt = Bufs.d_cnt[((r * 8) + a) * PEACH_PIPE_CNTPAD];
+      if (!c->lost_ok && cnt != want[a]) {
+         snprintf(msg, sizeof(msg), "round %d queue %d: cnt %u != %u", r, a,
+            (unsigned) cnt, (unsigned) want[a]);
+         fail(c->name, -1, msg);
+      }
+      n = peach_pipe_qlen(cnt, off, cap);
+      for (prev = 0, i = 0; i < n; i++) {
+         e = &Bufs.d_ent[off + i];
+         slot = e->id;
+         snprintf(msg, sizeof(msg), "round %d queue %d entry %u", r, a,
+            (unsigned) i);
+         if (slot >= (word32) count || seen[slot]++) {
+            fail(c->name, (long) slot, msg);
+            continue;
+         }
+         d = drop_round_of(&R[slot], c->masks);
+         if ((r < PEACHROUNDS && R[slot].algo[r] != (word32) a) ||
+               (d <= r && d < PEACHROUNDS) || !state_eq(e, R, slot, r)) {
+            fail(c->name, (long) slot, msg);
+         }
+         bk = (e->tile & PEACHCACHELEN_M1) >> PEACH_PIPE_SORT_SHIFT;
+         if (i > 0 && bk < prev) {
+            snprintf(msg, sizeof(msg), "round %d queue %d entry %u: tile"
+               " bucket %u after %u", r, a, (unsigned) i, (unsigned) bk,
+               (unsigned) prev);
+            fail(c->name, (long) slot, msg);
+         }
+         prev = bk;
+      }
+   }
+}
+
+/* launch a batch with the per-kernel launches of peach_pipe_enqueue()
+ * (used where the enqueue argument checks or its init do not apply);
+ * with R != NULL, check the queues of every round after their sort */
+static void launch_rounds(const PEACH_PIPE_PARAMS *p,
+   const PEACH_PIPE_BUFS *b, const PEACH_PIPE_LAUNCH *l, int with_init,
+   const CFG *c, const REFSLOT *R, int count)
+{
+   word32 mask;
+   int r, a;
+
+   if (with_init) {
+      memset(b->d_cnt, 0, sizeof(word32) * PEACH_PIPE_CNTZERO);
+      memset(b->d_res, 0, sizeof(PEACH_PIPE_RESULT));
+      CUDA_KERNEL(kcu_peach_pipe_init, l->grid_init, l->block, 0, NULL)
+         (*p, *b);
+   }
+   for (r = 0; r < PEACHROUNDS; r++) {
+      if (r > 0) {
+         peach_pipe_launch_sort(p, b, l, r, NULL);
+         if (R != NULL) check_round_queues(c, R, count, r);
+      }
+      mask = peach_pipe_skip_mask(p->skip, (word32) r);
+      for (a = 0; a < 8; a++) {
+         if ((mask >> a) & 1) continue;
+         peach_pipe_launch_hash(a, l->grid_hash[a], l->block, NULL, p, b,
+            r);
+      }
+   }
+   peach_pipe_launch_sort(p, b, l, PEACHROUNDS, NULL);
+   if (R != NULL) check_round_queues(c, R, count, PEACHROUNDS);
+   CUDA_KERNEL(kcu_peach_pipe_final, l->grid_final, l->block, 0, NULL)
+      (*p, *b);
 }
 
 /* compare a finished batch with the reference walks R[0..count-1]
@@ -384,8 +472,7 @@ static word64 check_batch(const CFG *c, const REFSLOT *R, int count,
    const PEACH_PIPE_RESULT *res = Bufs.d_res;
    const PEACH_PIPE_TRACE *t;
    const PEACH_PIPE_SLOT *s;
-   const word32 *fq;
-   word32 expcnt[9][8], cnt, over, m, e, i, slot, cap = Bufs.cap;
+   word32 expcnt[9][8], cnt, over, tot, m, e, i, slot, cap = Bufs.cap;
    word64 fails0 = Fails, alive = 0, dropped = 0, lost = 0, solvable = 0;
    BTRAILER cand;
    word8 out[SHA256LEN];
@@ -398,11 +485,10 @@ static word64 check_batch(const CFG *c, const REFSLOT *R, int count,
       t = &Bufs.d_trace[k];
       s = &Bufs.d_slot[k];
       d = drop_round_of(&R[k], c->masks);
-      /* slot state that does not depend on the run */
-      if (!words_eq(s->nonce, &R[k].nonce[4], 4)) {
-         fail(c->name, k, "slot nonce words 4..7");
+      /* slot state that does not depend on the run (round 0) */
+      if (!state_eq(s, R, (word32) k, 0)) {
+         fail(c->name, k, "slot state (nonce words 4..7, mario0, P)");
       }
-      if (s->p != R[k].p) fail(c->name, k, "slot P != reference");
       if (!words_eq(&Bufs.d_hash[(word32) k * 8], R[k].hash0, 8)) {
          fail(c->name, k, "slot hash0");
       }
@@ -426,7 +512,6 @@ static word64 check_batch(const CFG *c, const REFSLOT *R, int count,
             m = r <= j ? R[k].algo[r] : PEACH_PIPE_NOALGO;
             if (t->algo[r] != m) fail(c->name, k, "lost slot trace algo");
          }
-         if (s->mario != R[k].mario[j]) fail(c->name, k, "lost slot mario");
          continue;
       }
       /* expected trace */
@@ -450,7 +535,6 @@ static word64 check_batch(const CFG *c, const REFSLOT *R, int count,
       if (t->pad[0] || t->pad[1] || t->pad[2]) {
          fail(c->name, k, "trace pad");
       }
-      if (s->mario != R[k].mario[e]) fail(c->name, k, "slot mario");
       if (d < PEACHROUNDS) {
          dropped++;
          if (t->drop_round != (word8) d) fail(c->name, k, "drop round");
@@ -478,12 +562,15 @@ static word64 check_batch(const CFG *c, const REFSLOT *R, int count,
          fail(c->name, k, "trace written beyond nslots");
       }
    }
-   /* counters */
+   /* counters; overflow: past cap in a round 0 queue, or past cap in the
+    * entries of a later round */
    over = 0;
    for (r = 0; r <= PEACHROUNDS; r++) {
-      for (a = 0; a < 8; a++) {
+      for (tot = 0, a = 0; a < 8; a++) {
          cnt = Bufs.d_cnt[((r * 8) + a) * PEACH_PIPE_CNTPAD];
-         if (cnt > cap) over += cnt - cap;
+         if (r == 0 && cnt > cap) over += cnt - cap;
+         tot += cnt;
+         if (r > 0 && a == 7 && tot > cap) over += tot - cap;
          if (!c->lost_ok && cnt != expcnt[r][a]) {
             snprintf(msg, sizeof(msg), "cnt(%d,%d) %u != %u", r, a,
                (unsigned) cnt, (unsigned) expcnt[r][a]);
@@ -497,22 +584,28 @@ static word64 check_batch(const CFG *c, const REFSLOT *R, int count,
    if (c->lost_ok && lost == 0) fail(c->name, -1, "no overflow happened");
    if (res->anomaly != 0) fail(c->name, -1, "anomaly");
    if (res->epoch != epoch) fail(c->name, -1, "epoch");
-   /* final queue: a permutation of the completed slots */
-   fq = Bufs.d_q + (PEACH_PIPE_FINALQ * cap);
+   /* final queue: a permutation of the completed slots (tile ordered
+    * entries of their states); keys: final tile, or dead */
    cnt = Bufs.d_cnt[PEACH_PIPE_FINALCNT * PEACH_PIPE_CNTPAD];
    if ((cnt < cap ? cnt : cap) != alive) fail(c->name, -1, "final count");
    for (i = 0; i < alive && i < cap; i++) {
-      slot = fq[i];
+      slot = Bufs.d_ent[i].id;
       if (slot >= (word32) count || seen[slot]++ ||
             Bufs.d_trace[slot].drop_round != PEACH_PIPE_ALIVE) {
          fail(c->name, (long) i, "final queue entry");
       }
    }
+   check_round_queues(c, R, count, PEACHROUNDS);
+   for (k = 0; k < count; k++) {
+      e = Bufs.d_trace[k].drop_round == PEACH_PIPE_ALIVE ?
+         R[k].mario[PEACHROUNDS] : PEACH_PIPE_KEYDEAD;
+      if (Bufs.d_key[k] != e) fail(c->name, k, "slot key");
+   }
    /* canary: final queue entry 0 */
    if (alive == 0) {
       if (res->canary_valid != 0) fail(c->name, -1, "canary without entry");
    } else {
-      slot = fq[0];
+      slot = Bufs.d_ent[0].id;
       if (res->canary_valid != 1 || slot >= (word32) count ||
             !words_eq(res->canary_nonce_hi, &R[slot].nonce[4], 4) ||
             !words_eq(res->canary_hash, R[slot].final, 8)) {
@@ -567,7 +660,8 @@ static void check_helpers(void)
    PEACH_PIPE_LAUNCH l;
    PEACH_PIPE_BUFS b;
    word32 h[8], w, op, x, buf[2], tile[PEACHTILELEN32], list[20];
-   word64 fails0 = Fails, sum0, sum1;
+   word32 fr[4], fr2[4];
+   word64 fails0 = Fails, sum0, sum1, sd;
    word8 masks[8], *hb = (word8 *) h;
    word16 tt;
    int diff, z, i, j, k, nf;
@@ -588,6 +682,18 @@ static void check_helpers(void)
             }
          }
       }
+   }
+   /* nonce frame (packed tables, 32-bit halves) vs the official 64-bit
+    * frame: every value of every table index field, then random seeds */
+   for (i = 0; i < 64 + 4096; i++) {
+      sd = i >= 64 ? r64() : (word64) (i & 31) | ((word64) (i & 7) << 5) |
+         ((word64) (i & 63) << 8) | ((word64) (i & 63) << 14) |
+         ((word64) (i & 31) << 20) | ((word64) (i & 31) << 25) |
+         ((word64) (i & 63) << 30) | ((word64) (i & 63) << 36) |
+         ((word64) r32() << 42);
+      peach_pipe_frame(sd, fr);
+      frame_words(sd, fr2);
+      if (!words_eq(fr, fr2, 4)) fail("peach_pipe_frame()", i, "");
    }
    /* skip mask packing */
    for (i = 0; i < 64; i++) {
@@ -721,9 +827,9 @@ static void check_helpers(void)
       sum1 += (word64) T[i] * (word64) (i + 1);
    }
    if (sum0 != sum1) fail("transitions kernel", -1, "empty range wrote T");
-   printf("(0) diff_ok == trigg_eval (257 zero counts x 256 diffs), skip "
-      "packing, enqueue validation, self-test kernel (%d entries), "
-      "transitions kernel (adversarial tile, map end clamp): "
+   printf("(0) diff_ok == trigg_eval (257 zero counts x 256 diffs), nonce "
+      "frame, skip packing, enqueue validation, self-test kernel (%d "
+      "entries), transitions kernel (adversarial tile, map end clamp): "
       "mismatches %llu\n", NSELF, (unsigned long long) (Fails - fails0));
    ASSERT_EQ((Fails - fails0), (0));
 }
@@ -758,8 +864,7 @@ static void check_init(void)
    scramble_buffers(CAP);
    l.block = 128;
    l.grid_init = 5;
-   memset(Bufs.d_cnt, 0, sizeof(word32) * PEACH_PIPE_NCNT *
-      PEACH_PIPE_CNTPAD);
+   memset(Bufs.d_cnt, 0, sizeof(word32) * PEACH_PIPE_CNTZERO);
    memset(Bufs.d_res, 0, sizeof(PEACH_PIPE_RESULT));
    CUDA_KERNEL(kcu_peach_pipe_init, l.grid_init, l.block, 0, NULL)
       (Par, Bufs);
@@ -768,8 +873,9 @@ static void check_init(void)
       st = Rng0[k];
       frame_words(ref_rand64(&st), fr);
       if (Bufs.d_rng[k] != st) fail("init RNG state", k, "");
-      if (!words_eq(Bufs.d_slot[k].nonce, fr, 4)) {
-         fail("init nonce words 4..7", k, "");
+      if (Bufs.d_slot[k].seed[0] != (word32) st ||
+            Bufs.d_slot[k].seed[1] != (word32) (st >> 32)) {
+         fail("init slot frame random number", k, "");
       }
       memcpy(RefR[k].nonce, Par.nonce_lo, 16);
       memcpy(&RefR[k].nonce[4], fr, 16);
@@ -783,10 +889,9 @@ static void check_init(void)
       RefR[k].mario[0] = mario0_of(h0);
       RefR[k].p = peach_dflops(RefR[k].nonce, 32, RefR[k].mario[0], 0);
       if (!words_eq(&Bufs.d_hash[k * 8], h0, 8)) fail("init hash0", k, "");
-      if (Bufs.d_slot[k].mario != RefR[k].mario[0]) {
-         fail("init mario0", k, "");
+      if (!state_eq(&Bufs.d_slot[k], RefR, (word32) k, 0)) {
+         fail("init slot state (nonce words 4..7, mario0, P)", k, "");
       }
-      if (Bufs.d_slot[k].p != RefR[k].p) fail("init P", k, "");
       /* P is index independent (no NaN replacement in the nonce) */
       nf = 0;
       if (peach_prefix_words(RefR[k].nonce, 8, 0, (word32) k &
@@ -940,6 +1045,21 @@ static void check_realistic(void)
          fail("idle slot state", k, "touched");
       }
    }
+   /* configs 0 and 2 kernel by kernel: the tile ordered queues of every
+    * round right after their sort */
+   for (c = 0; c < NCFG; c += 2) {
+      p = Par;
+      p.skip = peach_pipe_skip_pack(cfg[c].masks);
+      p.diff = cfg[c].diff;
+      p.epoch = 0x3FF + (word32) c;
+      l.block = 96;
+      l.grid_init = l.grid_final = 5;
+      for (a = 0; a < 8; a++) l.grid_hash[a] = 1 + (2 * a);
+      memcpy(Bufs.d_rng, Rng0, sizeof(word64) * CAP);
+      scramble_buffers(CAP);
+      launch_rounds(&p, &Bufs, &l, 1, &cfg[c], RefR, NSLOTS);
+      check_batch(&cfg[c], RefR, NSLOTS, &Bt, p.epoch);
+   }
    check_sample();
    printf("    mismatches %llu, %.2fs\n",
       (unsigned long long) (Fails - fails0), now_s() - t0);
@@ -950,6 +1070,7 @@ static void check_realistic(void)
 static void check_synthetic(void)
 {
    static word32 order[NSYN];
+   static word64 seed[NSYN];
    PEACH_PIPE_PARAMS p;
    PEACH_PIPE_LAUNCH l;
    PEACH_PIPE_TRACE *t;
@@ -967,7 +1088,8 @@ static void check_synthetic(void)
    q = redraw_first_half(nlo);
    for (k = 0; k < NSYN; k++) {
       memcpy(RefS[k].nonce, nlo, 16);
-      frame_words(r64(), &RefS[k].nonce[4]);
+      seed[k] = r64();
+      frame_words(seed[k], &RefS[k].nonce[4]);
       for (i = 0; i < 8; i++) RefS[k].hash0[i] = r32();
       switch (k) {
          case 0: RefS[k].mario[0] = 1; break;
@@ -984,11 +1106,10 @@ static void check_synthetic(void)
       nonzero0 += (RefS[k].mario[0] != 0);
    }
    ref_walk(RefS, NSYN);
-   /* slot states, round-0 queues (random slot order) and traces as the
-    * init kernel would write them */
+   /* slot states, frame random numbers, round-0 queues (random slot
+    * order) and traces as the init kernel would write them */
    scramble_buffers(CAP);
-   memset(Bufs.d_cnt, 0, sizeof(word32) * PEACH_PIPE_NCNT *
-      PEACH_PIPE_CNTPAD);
+   memset(Bufs.d_cnt, 0, sizeof(word32) * PEACH_PIPE_CNTZERO);
    memset(Bufs.d_res, 0, sizeof(PEACH_PIPE_RESULT));
    for (k = 0; k < NSYN; k++) order[k] = (word32) k;
    for (k = NSYN - 1; k > 0; k--) {
@@ -997,10 +1118,13 @@ static void check_synthetic(void)
    }
    for (i = 0; i < NSYN; i++) {
       k = (int) order[i];
-      memcpy(Bufs.d_slot[k].nonce, &RefS[k].nonce[4], 16);
-      Bufs.d_slot[k].mario = RefS[k].mario[0];
-      Bufs.d_slot[k].p = RefS[k].p;
-      Bufs.d_slot[k].pad[0] = Bufs.d_slot[k].pad[1] = 0;
+      Bufs.d_slot[k].seed[0] = (word32) seed[k];
+      Bufs.d_slot[k].seed[1] = (word32) (seed[k] >> 32);
+      Bufs.d_slot[k].tile = RefS[k].mario[0] | ((RefS[k].p & 7) <<
+         PEACH_PIPE_PSHIFT);
+      Bufs.d_slot[k].id = (word32) k;
+      Bufs.d_rng[k] = seed[k];
+      Bufs.d_key[k] = PEACH_PIPE_KEYDEAD;
       memcpy(&Bufs.d_hash[k * 8], RefS[k].hash0, 32);
       t = &Bufs.d_trace[k];
       memset(t, 0, sizeof(*t));
@@ -1031,7 +1155,7 @@ static void check_synthetic(void)
    l.block = 128;
    l.grid_init = l.grid_final = 2;
    for (a = 0; a < 8; a++) l.grid_hash[a] = 1 + (int) a;
-   launch_rounds(&p, &Bufs, &l, 0);
+   launch_rounds(&p, &Bufs, &l, 0, &cfg, RefS, NSYN);
    printf("(3) synthetic batch: %d slots, %llu nonzero start tiles, "
       "round 0 uses %u algorithms\n", NSYN, (unsigned long long) nonzero0,
       (unsigned) cnt0);
@@ -1051,9 +1175,9 @@ static void check_smallcap(void)
    PEACH_PIPE_LAUNCH l;
    CFG cfg;
    word64 fails0 = Fails;
-   word32 c0, c8;
+   word32 c0, cr, tot;
    double t0 = now_s();
-   int a;
+   int a, r, rmax = 0;
 
    memset(&cfg, 0, sizeof(cfg));
    cfg.name = "cap 1024 < nslots 4096";
@@ -1069,23 +1193,176 @@ static void check_smallcap(void)
    for (a = 0; a < 8; a++) l.grid_hash[a] = 2;
    memcpy(Bufs.d_rng, Rng0, sizeof(word64) * CAP);
    scramble_buffers(SMALLCAP);
-   launch_rounds(&p, &Bufs, &l, 1);
+   launch_rounds(&p, &Bufs, &l, 1, &cfg, RefR, NSLOTS);
    printf("(4) small capacity run (per-kernel launches):\n");
    check_batch(&cfg, RefR, NSLOTS, &Bt, p.epoch);
-   /* both bounds exercised: a round-0 queue and the final queue */
+   /* both bounds exercised: a round-0 queue (slot queues) and the queues
+    * of a later round (packed entries) */
    for (c0 = 0, a = 0; a < 8; a++) {
       if (Bufs.d_cnt[a * PEACH_PIPE_CNTPAD] > c0) {
          c0 = Bufs.d_cnt[a * PEACH_PIPE_CNTPAD];
       }
    }
-   c8 = Bufs.d_cnt[PEACH_PIPE_FINALCNT * PEACH_PIPE_CNTPAD];
-   if (c0 <= SMALLCAP || c8 <= SMALLCAP) {
-      fail(cfg.name, -1, "round-0 and final queues must overflow");
+   for (cr = 0, r = 1; r <= PEACHROUNDS; r++) {
+      for (tot = 0, a = 0; a < 8; a++) {
+         tot += Bufs.d_cnt[((r * 8) + a) * PEACH_PIPE_CNTPAD];
+      }
+      if (tot > cr) {
+         cr = tot;
+         rmax = r;
+      }
    }
-   printf("    largest round-0 queue %u, final queue %u (cap %d), overflow "
-      "counter %u; mismatches %llu, %.2fs\n", (unsigned) c0, (unsigned) c8,
-      SMALLCAP, (unsigned) Bufs.d_res->overflow,
-      (unsigned long long) (Fails - fails0), now_s() - t0);
+   if (c0 <= SMALLCAP || cr <= SMALLCAP) {
+      fail(cfg.name, -1, "round-0 and later queues must overflow");
+   }
+   printf("    largest round-0 queue %u, largest later round %d: %u entries"
+      " (cap %d), overflow counter %u; mismatches %llu, %.2fs\n",
+      (unsigned) c0, rmax, (unsigned) cr, SMALLCAP,
+      (unsigned) Bufs.d_res->overflow, (unsigned long long) (Fails - fails0),
+      now_s() - t0);
+   ASSERT_EQ((Fails - fails0), (0));
+}
+
+/* (5) tile sort kernels on random keys */
+static void check_sort(void)
+{
+   static word32 want[8][CAP], nwant[8], hist[8][PEACH_PIPE_NBUCKET];
+   static word8 seen[CAP];
+   static const int rounds[4] = { 1, 4, 7, PEACHROUNDS };
+   const PEACH_PIPE_SLOT *e;
+   PEACH_PIPE_PARAMS p;
+   PEACH_PIPE_LAUNCH l;
+   CFG cfg;
+   word32 m, a, i, k, nq, cap, ns, *cur, lost, expover, kept, off, n, bk;
+   word32 prev, tot;
+   word64 fails0 = Fails;
+   double t0 = now_s();
+   char msg[96];
+   int t, rr, j;
+
+   memset(&cfg, 0, sizeof(cfg));
+   cfg.name = "tile sort kernels";
+   for (t = 0; t < 8; t++) {
+      rr = rounds[t & 3];
+      nq = rr < PEACHROUNDS ? 8 : 1;
+      cap = t < 4 ? CAP : 1500;
+      ns = t < 4 ? CAP - (word32) (t * 40) : 3000;
+      scramble_buffers(cap);
+      memset(Bufs.d_cnt, 0, sizeof(word32) * PEACH_PIPE_CNTZERO);
+      memset(Bufs.d_res, 0, sizeof(PEACH_PIPE_RESULT));
+      memset(hist, 0, sizeof(hist));
+      memset(nwant, 0, sizeof(nwant));
+      for (k = 0; k < ns; k++) {
+         /* slot state: random frame random number, stale tile, P & 7 */
+         Bufs.d_slot[k].seed[0] = r32();
+         Bufs.d_slot[k].seed[1] = r32();
+         Bufs.d_slot[k].tile = r32() & ((WORD32_C(8) << PEACH_PIPE_PSHIFT) -
+            1);
+         Bufs.d_slot[k].id = k;
+         Bufs.d_trace[k].drop_round = PEACH_PIPE_ALIVE;
+         i = r32() % 100;
+         if (i < 15) {
+            Bufs.d_key[k] = PEACH_PIPE_KEYDEAD;
+            continue;
+         }
+         /* hot bucket 0, the last tile, a hot middle bucket, uniform */
+         m = i < 35 ? r32() & ((1u << PEACH_PIPE_SORT_SHIFT) - 1) :
+            i < 45 ? PEACHCACHELEN_M1 :
+            i < 60 ? (0x5A5A5u & ~((1u << PEACH_PIPE_SORT_SHIFT) - 1)) |
+               (r32() & ((1u << PEACH_PIPE_SORT_SHIFT) - 1)) :
+            r32() & PEACHCACHELEN_M1;
+         /* round 8 (final queue): queue 0 only; else skewed queues */
+         a = nq == 1 ? 0 : (r32() % 3 == 0) ? 3 : r32() & 7;
+         Bufs.d_key[k] = (a << PEACH_PIPE_KEYSHIFT) | m;
+         hist[a][m >> PEACH_PIPE_SORT_SHIFT]++;
+         want[a][nwant[a]++] = k;
+      }
+      for (a = 0; a < nq; a++) {
+         memcpy(Bufs.d_cnt + PEACH_PIPE_HISTOFF + (((rr - 1) * 8 + a) *
+            PEACH_PIPE_NBUCKET), hist[a], sizeof(hist[a]));
+      }
+      p = Par;
+      p.nslots = ns;
+      l.block = 32 * (1 + (t % 4));
+      l.grid_init = 1 + (t * 3);
+      peach_pipe_launch_sort(&p, &Bufs, &l, rr, NULL);
+      /* counters (other queues of the round untouched); overflow: the
+       * entries past cap of the round's packed queues */
+      for (tot = 0, a = 0; a < 8; a++) {
+         k = Bufs.d_cnt[((rr * 8) + a) * PEACH_PIPE_CNTPAD];
+         if (k != (a < nq ? nwant[a] : 0)) {
+            snprintf(msg, sizeof(msg), "round %d cnt(%u) %u != %u", rr,
+               (unsigned) a, (unsigned) k, (unsigned) nwant[a]);
+            fail(cfg.name, t, msg);
+         }
+         if (a < nq) tot += nwant[a];
+      }
+      expover = tot > cap ? tot - cap : 0;
+      if (Bufs.d_res->overflow != expover) {
+         fail(cfg.name, t, "overflow counter");
+      }
+      /* keys and lost marks: exactly the entries past cap */
+      for (lost = 0, k = 0; k < ns; k++) {
+         if (Bufs.d_trace[k].drop_round == PEACH_PIPE_LOST) {
+            lost++;
+            if (Bufs.d_key[k] != PEACH_PIPE_KEYDEAD) {
+               fail(cfg.name, (long) k, "lost slot key not dead");
+            }
+         } else if (Bufs.d_trace[k].drop_round != PEACH_PIPE_ALIVE) {
+            fail(cfg.name, (long) k, "trace drop round");
+         }
+      }
+      for (k = ns; k < ns + 32 && k < CAP; k++) {
+         if (Bufs.d_key[k] != WORD32_C(0xA5A5A5A5) ||
+               Bufs.d_trace[k].drop_round != 0xEE) {
+            fail(cfg.name, (long) k, "slot beyond nslots touched");
+         }
+      }
+      if (lost != expover) fail(cfg.name, t, "lost slots != overflow");
+      memset(seen, 0, sizeof(seen));
+      for (off = 0, a = 0; a < nq; off += nwant[a], a++) {
+         n = peach_pipe_qlen(nwant[a], off, cap);
+         for (prev = 0, i = 0; i < n; i++) {
+            e = &Bufs.d_ent[off + i];
+            k = e->id;
+            if (k >= ns || seen[k]++ || Bufs.d_key[k] == PEACH_PIPE_KEYDEAD
+                  || (Bufs.d_key[k] >> PEACH_PIPE_KEYSHIFT) != a ||
+                  e->tile != ((Bufs.d_key[k] & PEACHCACHELEN_M1) |
+                  (Bufs.d_slot[k].tile & ~((word32) PEACHCACHELEN_M1))) ||
+                  e->seed[0] != Bufs.d_slot[k].seed[0] ||
+                  e->seed[1] != Bufs.d_slot[k].seed[1]) {
+               fail(cfg.name, (long) i, "queue entry");
+               continue;
+            }
+            bk = (e->tile & PEACHCACHELEN_M1) >> PEACH_PIPE_SORT_SHIFT;
+            if (i > 0 && bk < prev) fail(cfg.name, (long) i, "tile order");
+            prev = bk;
+         }
+         /* every wanted slot stored, or lost (past cap) */
+         for (kept = 0, j = 0; j < (int) nwant[a]; j++) {
+            k = want[a][j];
+            if (seen[k]) kept++;
+            else if (Bufs.d_trace[k].drop_round != PEACH_PIPE_LOST) {
+               fail(cfg.name, (long) k, "slot neither queued nor lost");
+            }
+         }
+         if (kept != n) fail(cfg.name, (long) a, "queued slots");
+         /* cursors: every bucket advanced to its end */
+         cur = Bufs.d_cnt + PEACH_PIPE_CUROFF + (a * PEACH_PIPE_NBUCKET);
+         for (k = 0, i = 0; i < PEACH_PIPE_NBUCKET; i++) {
+            k += hist[a][i];
+            if (cur[i] != k) {
+               fail(cfg.name, (long) i, "cursor != bucket end");
+               break;
+            }
+         }
+      }
+   }
+   printf("(5) tile sort kernels: 8 runs (rounds 1, 4, 7, final; capacity"
+      " %d and 1500, blocks 32..128), %d buckets of %d tiles; mismatches"
+      " %llu, %.2fs\n", CAP, PEACH_PIPE_NBUCKET,
+      1 << PEACH_PIPE_SORT_SHIFT, (unsigned long long) (Fails - fails0),
+      now_s() - t0);
    ASSERT_EQ((Fails - fails0), (0));
 }
 
@@ -1106,8 +1383,10 @@ int main(void)
    Bufs.d_slot = (PEACH_PIPE_SLOT *) galloc(sizeof(PEACH_PIPE_SLOT) * CAP);
    Bufs.d_hash = (word32 *) galloc(sizeof(word32) * 8 * CAP);
    Bufs.d_q = (word32 *) galloc(sizeof(word32) * PEACH_PIPE_NQUEUE * CAP);
-   Bufs.d_cnt = (word32 *) galloc(sizeof(word32) * PEACH_PIPE_NCNT *
-      PEACH_PIPE_CNTPAD);
+   Bufs.d_ent = (PEACH_PIPE_SLOT *) galloc(sizeof(PEACH_PIPE_SLOT) *
+      CAP);
+   Bufs.d_cnt = (word32 *) galloc(sizeof(word32) * PEACH_PIPE_CNTWORDS);
+   Bufs.d_key = (word32 *) galloc(sizeof(word32) * CAP);
    Bufs.d_res = (PEACH_PIPE_RESULT *) galloc(sizeof(PEACH_PIPE_RESULT));
    Bufs.d_trace = (PEACH_PIPE_TRACE *)
       galloc(sizeof(PEACH_PIPE_TRACE) * CAP);
@@ -1118,6 +1397,7 @@ int main(void)
    check_realistic();
    check_synthetic();
    check_smallcap();
+   check_sort();
    if (Fails) {
       printf("peach-pipeline: %llu checks FAILED\n",
          (unsigned long long) Fails);

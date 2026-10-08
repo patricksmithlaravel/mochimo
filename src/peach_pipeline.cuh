@@ -86,18 +86,45 @@ static __device__ __forceinline__ word64 cu_rand64(word64 *d_state)
 
 /* Pipeline layout constants */
 #define PEACH_PIPE_BLOCK      128   /**< threads per block, every kernel */
-#define PEACH_PIPE_NQUEUE     17    /**< queues: 2 parities x 8 + final */
+#define PEACH_PIPE_NQUEUE     8     /**< slot queues: round 0, per algo */
 #define PEACH_PIPE_CNTPAD     32    /**< words per (padded) counter */
 #define PEACH_PIPE_NCNT       72    /**< counters: 9 rounds x 8 algos */
 #define PEACH_PIPE_SKIP_MD2   0x40  /**< default per-round skip mask */
-#define PEACH_PIPE_FINALQ     16    /**< queue number of the final queue */
 #define PEACH_PIPE_FINALCNT   64    /**< counter number of the final queue
                                        (round 8, algo 0) */
 #define PEACH_PIPE_TILEVEC    64    /**< 16-byte vectors per map tile */
 #define PEACH_PIPE_MAXCAP     WORD32_C(0x1000000)  /**< max. queue
-   capacity (keeps all 17 x cap queue offsets in 32 bits) */
+   capacity (keeps all 8 x cap queue offsets in 32 bits) */
 #define PEACH_PIPE_MAXGRID    65535  /**< max. blocks per launch; keeps
    the 32-bit stride of the block-uniform loops from wrapping */
+
+/* Tile order of the queues of rounds 1..7 and of the final queue: a
+ * counting sort of their entries by queue and tile bucket (tile >>
+ * SORT_SHIFT), so the hash and final kernels read the map in ascending
+ * tile order (and their entries sequentially) */
+#ifndef PEACH_PIPE_SORT_SHIFT
+#define PEACH_PIPE_SORT_SHIFT 8     /**< tiles per bucket: 1 << shift */
+#endif
+#define PEACH_PIPE_NBUCKET    (PEACHCACHELEN >> PEACH_PIPE_SORT_SHIFT)
+   /**< tile buckets per histogram (4096) */
+#define PEACH_PIPE_NHIST      57    /**< histograms: queue (r, a) of
+   rounds r = 1..7 at (r - 1) * 8 + a, the final queue at 56 */
+#define PEACH_PIPE_HISTOFF    (PEACH_PIPE_NCNT * PEACH_PIPE_CNTPAD)
+   /**< word offset of the histograms in d_cnt */
+#define PEACH_PIPE_CUROFF     (PEACH_PIPE_HISTOFF + \
+   (PEACH_PIPE_NHIST * PEACH_PIPE_NBUCKET))
+   /**< word offset of the bucket cursors (8 x NBUCKET) in d_cnt */
+#define PEACH_PIPE_CNTZERO    PEACH_PIPE_CUROFF
+   /**< leading words of d_cnt zeroed per batch (counters, histograms) */
+#define PEACH_PIPE_CNTWORDS   (PEACH_PIPE_CUROFF + \
+   (8 * PEACH_PIPE_NBUCKET))   /**< words of d_cnt */
+#define PEACH_PIPE_KEYSHIFT   20    /**< key = queue << 20 | tile */
+#define PEACH_PIPE_KEYDEAD    WORD32_C(0xFFFFFFFF)  /**< key of a slot
+   that is not in the next round's queues */
+#define PEACH_PIPE_PSHIFT     20    /**< position of P & 7 in the tile
+                                       word of a slot state */
+#define PEACH_PIPE_SCANGRID   8     /**< blocks of a scan launch (one per
+   queue of the round) */
 
 /* Trace values (PEACH_PIPE_TRACE) */
 #define PEACH_PIPE_ALIVE      0xFF  /**< drop_round: never dropped */
@@ -114,13 +141,17 @@ static __device__ __forceinline__ word64 cu_rand64(word64 *d_state)
    peach_dflops_step(), its NaN flag (0/1), peach_dflops_incs() */
 
 /**
- * Per-slot (nonce) state of a batch. 32 bytes.
+ * State of a slot (nonce) in a round: of round 0 in the slot states
+ * (d_slot, written by init), of rounds 1..7 and the final round in the
+ * entries of the tile ordered queues (d_ent). 16 bytes, one uint4.
 */
 typedef struct {
-   word32 nonce[4];     /**< nonce words 4..7 (GPU frame) */
-   word32 mario;        /**< current tile index */
-   word32 p;            /**< op after nonce words 0..7 (only p & 7 used) */
-   word32 pad[2];       /**< padding to 32 bytes */
+   word32 seed[2];      /**< the slot's frame random number (low, high
+                           word): nonce words 4..7 are
+                           peach_pipe_frame(seed) */
+   word32 tile;         /**< tile index of the round | (P & 7) << 20,
+                           P = op after nonce words 0..7 */
+   word32 id;           /**< slot number */
 } PEACH_PIPE_SLOT;
 
 /**
@@ -181,14 +212,22 @@ typedef struct {
 typedef struct {
    const uint4 *d_map;        /**< Peach map, 1 GiB */
    const word16 *d_T;         /**< transition table, PEACHCACHELEN */
-   word64 *d_rng;             /**< RNG state, cap */
-   PEACH_PIPE_SLOT *d_slot;   /**< slot states, cap */
+   word64 *d_rng;             /**< RNG state, cap (after init: the
+                                 frame random number of the batch) */
+   PEACH_PIPE_SLOT *d_slot;   /**< slot states of round 0, cap */
    word32 *d_hash;            /**< hash0 per slot, cap * 8 */
-   word32 *d_q;               /**< queues, PEACH_PIPE_NQUEUE * cap:
-                                 q[parity][algo] at (parity*8 + algo) * cap,
-                                 final queue at 16 * cap */
-   word32 *d_cnt;             /**< counters, PEACH_PIPE_NCNT * CNTPAD:
-                                 cnt(r, a) = d_cnt[(r*8 + a) * 32] */
+   word32 *d_q;               /**< round 0 queues (slot numbers),
+                                 PEACH_PIPE_NQUEUE * cap: algo a at a * cap */
+   PEACH_PIPE_SLOT *d_ent;    /**< entries of the tile ordered queues of
+                                 the current round (1..7) or of the final
+                                 queue, cap: queue a after the queues
+                                 0..a-1 of its round */
+   word32 *d_cnt;             /**< counters, PEACH_PIPE_CNTWORDS:
+                                 cnt(r, a) = d_cnt[(r*8 + a) * 32], then
+                                 the tile histograms and cursors */
+   word32 *d_key;             /**< sort key per slot, cap: queue and tile
+                                 of the slot's next queue entry
+                                 (PEACH_PIPE_KEYDEAD: none) */
    PEACH_PIPE_RESULT *d_res;  /**< batch result */
    PEACH_PIPE_TRACE *d_trace; /**< optional trace, cap (or NULL) */
    word32 cap;                /**< queue capacity (= max slots) */
@@ -206,13 +245,15 @@ typedef struct {
 
 /* compile time size checks */
 typedef char peach_pipe_slot_size_check[
-   sizeof(PEACH_PIPE_SLOT) == 32 ? 1 : -1];
+   sizeof(PEACH_PIPE_SLOT) == 16 ? 1 : -1];
 typedef char peach_pipe_trace_size_check[
    sizeof(PEACH_PIPE_TRACE) == 80 ? 1 : -1];
 typedef char peach_pipe_params_size_check[
    sizeof(PEACH_PIPE_PARAMS) == 104 ? 1 : -1];
 typedef char peach_pipe_result_size_check[
    sizeof(PEACH_PIPE_RESULT) == 136 ? 1 : -1];
+typedef char peach_pipe_bucket_check[(PEACH_PIPE_SORT_SHIFT >= 4 &&
+   PEACH_PIPE_SORT_SHIFT <= 13) ? 1 : -1];
 
 /**
  * @private
@@ -245,7 +286,8 @@ PEACH_HD word64 peach_pipe_skip_pack(const word8 masks[8])
 /****************************************************************
  * PIPELINE KERNELS
  *    kcu_peach_pipe_transitions, kcu_peach_pipe_init,
- *    kcu_peach_pipe_hash_<algo> (x8), kcu_peach_pipe_final,
+ *    kcu_peach_pipe_hash_<algo> (x8), kcu_peach_pipe_scan,
+ *    kcu_peach_pipe_scatter, kcu_peach_pipe_final,
  *    kcu_peach_pipe_selftest and PEACH_HOST peach_pipe_enqueue().
  * <br />
  * Compiled at the first inclusion of this header unless
@@ -257,15 +299,28 @@ PEACH_HD word64 peach_pipe_skip_pack(const word8 masks[8])
  * tables, whose addresses -- and so the official kernels' SASS -- stay
  * unchanged.
  * <br />
- * Queues and counters of a batch (PEACH_PIPE_BUFS):
- * - round r = 0..7 consumes q[r & 1][a] (d_q + ((r & 1) * 8 + a) * cap)
- *   with counter cnt(r, a) (d_cnt[(r * 8 + a) * PEACH_PIPE_CNTPAD]),
- *   filled by init (r = 0) or by the hash kernels of round r - 1;
- * - the hash kernels of round 7 fill the final queue (d_q + 16 * cap)
- *   with counter cnt(8, 0); counters are never reused within a batch.
- * Each slot is appended at most once per round, so with cap >= nslots no
- * append can overflow; consumers still read min(cnt, cap) entries, and
- * an append at an index >= cap counts in PEACH_PIPE_RESULT.overflow.
+ * Queues and counters of a batch (PEACH_PIPE_BUFS); queue (r, a) holds
+ * the nonces whose jump in round r uses algo a, its length is the
+ * counter cnt(r, a) (d_cnt[(r * 8 + a) * PEACH_PIPE_CNTPAD]), and the
+ * final queue is queue (8, 0); counters are never reused within a batch.
+ * - Round 0: init appends slot numbers to q[a] (d_q + a * cap), unordered
+ *   (mario0 is tile 0 for most nonces); the hash kernels read the slot
+ *   states (d_slot).
+ * - Rounds 1..7 and the final queue: entries (the slot states of that
+ *   round) in d_ent, queue (r, a) at offset off(r, a) = cnt(r, 0) + .. +
+ *   cnt(r, a - 1), in ascending tile bucket order (tile >>
+ *   PEACH_PIPE_SORT_SHIFT). A hash kernel of round r - 1 stores each
+ *   surviving slot's next queue and tile as the slot's key (d_key) and
+ *   counts it in that queue's tile bucket histogram; then
+ *   kcu_peach_pipe_scan() turns the histograms of round r into bucket
+ *   cursors and the counters cnt(r, a), and kcu_peach_pipe_scatter()
+ *   sweeps the keys of all slots and stores the state of each live slot,
+ *   with its next tile, at the next index of its bucket (a counting
+ *   sort). The hash and final kernels so read their entries sequentially
+ *   and the map in ascending tile order.
+ * Each slot enters at most one queue per round, so with cap >= nslots no
+ * queue can overflow; consumers still read only entries below cap, and an
+ * entry at an index >= cap counts in PEACH_PIPE_RESULT.overflow.
  * <br />
  * Every kernel runs a block-uniform loop over its items:
  * `for (base = blockIdx.x * blockDim.x; base < n; base += gridDim.x *
@@ -352,6 +407,31 @@ PEACH_DEV word64 peach_pipe_rand64(word64 *state)
    return (*state = z ^ (z >> 31));
 }  /* end peach_pipe_rand64() */
 
+/* Nonce frame tables of peach_pipe_frame(), as bytes in one array (one
+ * base address in the hash kernels): Z_ING, Z_PREP, Z_ADJ, Z_NS, Z_MASS
+ * at the PEACH_PIPE_FRAME_* offsets, the same values (all below 256) */
+#define PEACH_PIPE_FRAME_ING   0
+#define PEACH_PIPE_FRAME_PREP  32
+#define PEACH_PIPE_FRAME_ADJ   40
+#define PEACH_PIPE_FRAME_NS    104
+#define PEACH_PIPE_FRAME_MASS  168
+#define PEACH_PIPE_FRAME_LEN   200
+static __device__ const word8 c_peach_pipe_frame[PEACH_PIPE_FRAME_LEN] = {
+   18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+   36, 37, 38, 39, 40, 41, 42, 43, 23, 24, 31, 32, 33, 34, 12, 13, 14, 15,
+   16, 17, 12, 13, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74,
+   75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92,
+   94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 107, 108, 109, 110,
+   112, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126,
+   127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 145, 149,
+   154, 155, 156, 157, 177, 178, 179, 180, 182, 183, 184, 185, 186, 187,
+   188, 189, 190, 191, 192, 193, 194, 196, 197, 198, 199, 200, 201, 202,
+   203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 241, 244, 245,
+   246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 214, 215, 216, 217,
+   218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231,
+   232, 233, 234, 235, 236, 237, 238, 239, 240, 242, 214, 215, 216, 219
+};
+
 /**
  * @private
  * Nonce words 4..7 from a 64-bit random number: the official GPU nonce
@@ -362,22 +442,23 @@ PEACH_DEV word64 peach_pipe_rand64(word64 *state)
 */
 PEACH_DEV void peach_pipe_frame(word64 s, word32 *n)
 {
-   word64 n2, n3;
+   const word8 *z = c_peach_pipe_frame;
+   const word32 lo = (word32) s, hi = (word32) (s >> 32);
 
-   n2 = WORD64_C(0x10000050000) |
-       Z_ING[(s      ) & 31]       |
-      Z_PREP[(s >>  5) &  7] <<  8 |
-       Z_ADJ[(s >>  8) & 63] << 24 |
-        Z_NS[(s >> 14) & 63] << 32 |
-      Z_MASS[(s >> 20) & 31] << 48 |
-       Z_ING[(s >> 25) & 31] << 56;
-   n3 =       WORD64_C(0x50103) |
-       Z_ADJ[(s >> 30) & 63] << 24 |
-        Z_NS[(s >> 36) & 63] << 32;
-   n[0] = (word32) n2;
-   n[1] = (word32) (n2 >> 32);
-   n[2] = (word32) n3;
-   n[3] = (word32) (n3 >> 32);
+   /* the official 64-bit words, n2 = 0x10000050000 | ING | PREP << 8 |
+    * ADJ << 24 | NS << 32 | MASS << 48 | ING << 56 and n3 = 0x50103 |
+    * ADJ << 24 | NS << 32, as 32-bit halves (every table value is below
+    * 256, so no term crosses a half) */
+   n[0] = WORD32_C(0x50000) | (word32) z[PEACH_PIPE_FRAME_ING + (lo & 31)] |
+      ((word32) z[PEACH_PIPE_FRAME_PREP + ((lo >> 5) & 7)] << 8) |
+      ((word32) z[PEACH_PIPE_FRAME_ADJ + ((lo >> 8) & 63)] << 24);
+   n[1] = WORD32_C(0x100) | (word32) z[PEACH_PIPE_FRAME_NS +
+      ((lo >> 14) & 63)] |
+      ((word32) z[PEACH_PIPE_FRAME_MASS + ((lo >> 20) & 31)] << 16) |
+      ((word32) z[PEACH_PIPE_FRAME_ING + ((lo >> 25) & 31)] << 24);
+   n[2] = WORD32_C(0x50103) | ((word32) z[PEACH_PIPE_FRAME_ADJ +
+      (((lo >> 30) | (hi << 2)) & 63)] << 24);
+   n[3] = (word32) z[PEACH_PIPE_FRAME_NS + ((hi >> 4) & 63)];
 }  /* end peach_pipe_frame() */
 
 /**
@@ -470,6 +551,60 @@ PEACH_DEV void peach_pipe_count(int valid, PEACH_PIPE_RESULT *res)
 
 /**
  * @private
+ * Count nonces dropped by a skip mask in one loop iteration: one ballot
+ * and one atomic per warp on the device, one atomic per drop in CPU
+ * emulation. Called by every thread (see append).
+ * @param drop Non-zero if this thread dropped its nonce
+ * @param res Batch result
+*/
+PEACH_DEV void peach_pipe_count_drop(int drop, PEACH_PIPE_RESULT *res)
+{
+#ifdef __CUDA_ARCH__
+   word32 c = __ballot_sync(0xFFFFFFFFu, drop);
+
+   if ((threadIdx.x & 31) == 0 && c != 0) {
+      PEACH_ATOMIC_ADD32(&res->dropped, __popc(c));
+   }
+#else
+   if (drop) PEACH_ATOMIC_ADD32(&res->dropped, 1);
+#endif
+}  /* end peach_pipe_count_drop() */
+
+/**
+ * @private
+ * Offset of queue (r, @a a) in the entries of round r (rounds 1..8):
+ * the sum of the counters of the queues before it.
+ * @param cnt Counters of round r (cnt(r, 0))
+ * @param a Queue (algorithm), 0..8 (8: the end of the round's queues)
+ * @returns offset of the queue in d_ent
+*/
+PEACH_DEV word32 peach_pipe_qoff(const word32 *cnt, word32 a)
+{
+   word32 off = 0, i;
+
+   PEACH_PIPE_UNROLL
+   for (i = 0; i < 8; i++) {
+      if (i < a) off += PEACH_LDG32(&cnt[i * PEACH_PIPE_CNTPAD]);
+   }
+   return off;
+}  /* end peach_pipe_qoff() */
+
+/**
+ * @private
+ * Entries of a queue that are stored (below the capacity).
+ * @param cnt Queue counter
+ * @param off Offset of the queue (0 for the queues of round 0)
+ * @param cap Queue capacity
+ * @returns number of stored entries
+*/
+PEACH_HD word32 peach_pipe_qlen(word32 cnt, word32 off, word32 cap)
+{
+   if (off >= cap) return 0;
+   return cnt < cap - off ? cnt : cap - off;
+}  /* end peach_pipe_qlen() */
+
+/**
+ * @private
  * Nighthash of a jump seed view with algorithm @a algo (a constant at
  * every call site, so only one hash survives inlining).
  * @param algo Algorithm 0..7 (peach_nighthash() numbering)
@@ -497,10 +632,12 @@ PEACH_DEV void peach_pipe_hash(word32 algo, const word32 *n, word32 m,
 /**
  * @private
  * Body of the hash kernel of algorithm @a algo in round @a round: for
- * each entry of q[round & 1][algo], hash the slot's jump seed view, store
- * the next tile index, select the next algorithm (rounds 0..6) and
- * append the slot to its round + 1 queue unless that round's skip mask
- * drops it; round 7 appends to the final queue.
+ * each entry of queue (round, algo), hash the slot's jump seed view,
+ * select the next algorithm (rounds 0..6) and, unless that round's skip
+ * mask drops the slot, store its key (next queue, tile and P & 7) and
+ * count it in the tile histogram of that queue; round 7 does so for the
+ * final queue. A dropped slot gets the key PEACH_PIPE_KEYDEAD.
+ * kcu_peach_pipe_scatter() then builds the queues of round + 1.
  * @param p Batch parameters
  * @param b Batch buffers
  * @param round Round number, 0..7
@@ -512,18 +649,23 @@ PEACH_DEV void peach_pipe_round(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b,
 {
    const word32 r = (word32) round & 7;
    const int last = (r == PEACHROUNDS - 1);
-   const word32 *qin = b.d_q + ((((r & 1) * 8) + algo) * b.cap);
-   word32 *qout = b.d_q + ((last ? PEACH_PIPE_FINALQ :
-      ((r + 1) & 1) * 8) * b.cap);
-   word32 *cout = b.d_cnt + ((r + 1) * 8 * PEACH_PIPE_CNTPAD);
+   const word32 *cnt = b.d_cnt + (r * 8 * PEACH_PIPE_CNTPAD);
+   const word32 *qin = b.d_q + (algo * b.cap);
+   const PEACH_PIPE_SLOT *ein;
+   /* tile histograms of the round r + 1 queues (or the final queue) */
+   word32 *hist = b.d_cnt + PEACH_PIPE_HISTOFF +
+      (r * 8 * PEACH_PIPE_NBUCKET);
    word32 mask = last ? 0 : peach_pipe_skip_mask(p.skip, r + 1);
-   word32 n8[8], dh[8], n, base, k, slot, m, pf, key;
+   word32 n8[8], dh[8], n, off, base, k, slot, m, pf, key;
    PEACH_PIPE_TRACE *t;
-   uint4 v;
-   int valid, keep, drop, stored;
+   uint4 w;
+   int valid, keep, drop;
 
-   n = PEACH_LDG32(&b.d_cnt[((r * 8) + algo) * PEACH_PIPE_CNTPAD]);
-   if (n > b.cap) n = b.cap;
+   /* round 0: slot queue q[algo]; else entries of queue (r, algo) */
+   off = r == 0 ? 0 : peach_pipe_qoff(cnt, algo);
+   n = peach_pipe_qlen(PEACH_LDG32(&cnt[algo * PEACH_PIPE_CNTPAD]), off,
+      b.cap);
+   ein = b.d_ent + off;
    for (base = blockIdx.x * blockDim.x; base < n;
          base += gridDim.x * blockDim.x) {
       k = base + threadIdx.x;
@@ -531,35 +673,39 @@ PEACH_DEV void peach_pipe_round(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b,
       slot = m = key = 0;
       keep = drop = 0;
       if (valid) {
-         slot = PEACH_LDG32(&qin[k]);
+         /* slot state: round 0 from the slot queue, else the entry */
+         w = PEACH_LDG128(r == 0 ? &b.d_slot[PEACH_LDG32(&qin[k])] :
+            &ein[k]);
          /* nonce: words 0..3 per batch, words 4..7 per slot */
-         v = PEACH_LDG128(b.d_slot[slot].nonce);
          n8[0] = p.nonce_lo[0]; n8[1] = p.nonce_lo[1];
          n8[2] = p.nonce_lo[2]; n8[3] = p.nonce_lo[3];
-         n8[4] = v.x; n8[5] = v.y; n8[6] = v.z; n8[7] = v.w;
-         pf = PEACH_LDG32(&b.d_slot[slot].p);
-         m = b.d_slot[slot].mario;
+         peach_pipe_frame(((word64) w.y << 32) | w.x, &n8[4]);
+         m = w.z & PEACHCACHELEN_M1;
+         pf = w.z >> PEACH_PIPE_PSHIFT;
+         slot = w.w;
          /* jump: next tile = sum of the digest words */
          peach_pipe_hash(algo, n8, m,
             &b.d_map[(size_t) m * PEACH_PIPE_TILEVEC], sbox, dh);
          m = (dh[0] + dh[1] + dh[2] + dh[3] + dh[4] + dh[5] + dh[6] +
             dh[7]) & PEACHCACHELEN_M1;
-         b.d_slot[slot].mario = m;
          if (last) keep = 1;
          else {
             key = peach_select_algo(pf, PEACH_LDG16(&b.d_T[m]));
             keep = !((mask >> key) & 1);
             drop = !keep;
          }
+         if (keep) {
+            PEACH_ATOMIC_ADD32(&hist[(key * PEACH_PIPE_NBUCKET) +
+               (m >> PEACH_PIPE_SORT_SHIFT)], 1);
+            b.d_key[slot] = (key << PEACH_PIPE_KEYSHIFT) | m;
+         } else b.d_key[slot] = PEACH_PIPE_KEYDEAD;
       }
-      stored = peach_pipe_append(qout, cout, b.cap, key, keep, drop, slot,
-         b.d_res);
+      peach_pipe_count_drop(drop, b.d_res);
       if (valid && b.d_trace != NULL) {
          t = &b.d_trace[slot];
          t->mario[r + 1] = m;
          if (!last) t->algo[r + 1] = (word8) key;
          if (drop) t->drop_round = (word8) (r + 1);
-         else if (!stored) t->drop_round = PEACH_PIPE_LOST;
       }
    }
 }  /* end peach_pipe_round() */
@@ -610,7 +756,9 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
  * hash0 bytes & 0xFFFFF, P = op after the nonce (from p.q over words
  * 4..7), algo0 = select(P, T[mario0]); append the slot to q[0][algo0]
  * unless skip mask 0 drops it. A NaN replacement in words 4..7 (never
- * expected) drops the slot and counts in the result's anomaly.
+ * expected) drops the slot and counts in the result's anomaly. Sets the
+ * key of every slot to PEACH_PIPE_KEYDEAD (round 0 sets the keys of the
+ * slots it processes).
  * Requires d_cnt and d_res zeroed (peach_pipe_enqueue()).
  * @param p Batch parameters
  * @param b Batch buffers
@@ -620,7 +768,9 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
 {
    const word32 mask = peach_pipe_skip_mask(p.skip, 0);
    word32 mid[8], tail[7], n8[8], h0[8], base, k, i, m, pf, algo;
+   word64 seed;
    PEACH_PIPE_TRACE *t;
+   uint4 st;
    int valid, keep, drop, stored, nanf;
 
    /* batch constants: constant indices only (kernel parameters) */
@@ -637,7 +787,8 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
       if (valid) {
          n8[0] = p.nonce_lo[0]; n8[1] = p.nonce_lo[1];
          n8[2] = p.nonce_lo[2]; n8[3] = p.nonce_lo[3];
-         peach_pipe_frame(peach_pipe_rand64(&b.d_rng[k]), &n8[4]);
+         seed = peach_pipe_rand64(&b.d_rng[k]);
+         peach_pipe_frame(seed, &n8[4]);
          peach_sha256_trailer(mid, tail, n8, h0);
          /* mario0 = product of the 32 hash0 bytes, mod 2^32 */
          m = 1;
@@ -654,14 +805,12 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
          pf = peach_dflops_step(n8[7], pf, m, &nanf);
          algo = peach_select_algo(pf, PEACH_LDG16(&b.d_T[m]));
          /* slot state and hash0 */
-         b.d_slot[k].nonce[0] = n8[4];
-         b.d_slot[k].nonce[1] = n8[5];
-         b.d_slot[k].nonce[2] = n8[6];
-         b.d_slot[k].nonce[3] = n8[7];
-         b.d_slot[k].mario = m;
-         b.d_slot[k].p = pf;
-         b.d_slot[k].pad[0] = 0;
-         b.d_slot[k].pad[1] = 0;
+         st.x = (word32) seed;
+         st.y = (word32) (seed >> 32);
+         st.z = m | ((pf & 7) << PEACH_PIPE_PSHIFT);
+         st.w = k;
+         *((uint4 *) &b.d_slot[k]) = st;
+         b.d_key[k] = PEACH_PIPE_KEYDEAD;
          PEACH_PIPE_UNROLL
          for (i = 0; i < 8; i++) b.d_hash[(k * 8) + i] = h0[i];
          if (nanf) PEACH_ATOMIC_ADD32(&b.d_res->anomaly, 1);
@@ -720,11 +869,17 @@ PEACH_PIPE_HASH_KERNEL(kcu_peach_pipe_hash_md5, 7)
  * CUDA hash kernel, algo 6: MD2. Stages the S-box in a 256-byte shared
  * table (data dependent lookups; constant memory would serialize them)
  * before the block-uniform loop of peach_pipe_round().
+ * <br />
+ * Its 64 state and checksum byte registers leave it needing 84..90
+ * registers; without an occupancy target ptxas squeezes it into 80 (6
+ * blocks of 128 threads per 64K-register SM) with stack spills on some
+ * architectures. The target of 5 blocks per SM (at most 102 registers)
+ * is a bound it meets without spills, not a register cap.
  * @param p Batch parameters
  * @param b Batch buffers
  * @param round Round number, 0..7
 */
-PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
+PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK, 5)
    kcu_peach_pipe_hash_md2(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b,
    int round)
 {
@@ -747,6 +902,129 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
 }  /* end kcu_peach_pipe_hash_md2() */
 
 /**
+ * CUDA kernel turning the tile histograms of the queues of round @a round
+ * (1..7; 8: the final queue) into bucket cursors (exclusive prefix sums,
+ * the start of each bucket in its queue) and the queue counters cnt(round,
+ * a) (the totals). Block a handles queue a (round 8: block 0 only); grid
+ * PEACH_PIPE_SCANGRID, any block that is a multiple of 32 (at most
+ * PEACH_PIPE_BLOCK); each thread scans a contiguous run of buckets.
+ * @param b Batch buffers
+ * @param round Round of the queues, 1..8
+*/
+PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
+   kcu_peach_pipe_scan(PEACH_PIPE_BUFS b, int round)
+{
+   const word32 rr = (word32) round;
+   const word32 a = blockIdx.x;
+   const word32 per = (PEACH_PIPE_NBUCKET + blockDim.x - 1) / blockDim.x;
+   const word32 lo = threadIdx.x * per < PEACH_PIPE_NBUCKET ?
+      threadIdx.x * per : PEACH_PIPE_NBUCKET;
+   const word32 hi = lo + per < PEACH_PIPE_NBUCKET ?
+      lo + per : PEACH_PIPE_NBUCKET;
+   const word32 *h;
+   word32 *cur, sum, pre, total, i;
+
+   /* block-uniform exit: queues of the round */
+   if (rr < 1 || rr > PEACHROUNDS || a >= (rr < PEACHROUNDS ? 8u : 1u)) {
+      return;
+   }
+   h = b.d_cnt + PEACH_PIPE_HISTOFF +
+      ((((rr - 1) * 8) + a) * PEACH_PIPE_NBUCKET);
+   cur = b.d_cnt + PEACH_PIPE_CUROFF + (a * PEACH_PIPE_NBUCKET);
+   for (sum = 0, i = lo; i < hi; i++) sum += h[i];
+
+#ifdef __CUDA_ARCH__
+   {
+      __shared__ word32 s_part[PEACH_PIPE_BLOCK / 32];
+      const word32 lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+      word32 x = sum, y, o;
+
+      /* inclusive warp scan, then the totals of the warps before */
+      for (o = 1; o < 32; o <<= 1) {
+         y = __shfl_up_sync(0xFFFFFFFFu, x, o);
+         if (lane >= o) x += y;
+      }
+      if (lane == 31) s_part[warp] = x;
+      __syncthreads();
+      pre = x - sum;
+      for (total = 0, i = 0; i < (blockDim.x >> 5); i++) {
+         if (i < warp) pre += s_part[i];
+         total += s_part[i];
+      }
+   }
+#else
+   /* per-thread fallback: the buckets before this thread's run */
+   for (pre = total = 0, i = 0; i < PEACH_PIPE_NBUCKET; i++) {
+      if (i < lo) pre += h[i];
+      total += h[i];
+   }
+#endif
+
+   for (i = lo; i < hi; i++) {
+      cur[i] = pre;
+      pre += h[i];
+   }
+   if (threadIdx.x == 0) {
+      b.d_cnt[((rr * 8) + a) * PEACH_PIPE_CNTPAD] = total;
+   }
+}  /* end kcu_peach_pipe_scan() */
+
+/**
+ * CUDA kernel building the queues of round @a round (1..7; 8: the final
+ * queue) in tile bucket order: for each slot k < p.nslots with a live key
+ * (queue a, tile m), take the next index of bucket m >> SORT_SHIFT of
+ * queue a from its cursor (kcu_peach_pipe_scan()) and store there, at
+ * offset off(round, a) in d_ent, the state of slot k with tile m. An
+ * index >= cap (never with cap >= nslots) counts in the result's
+ * overflow, kills the key and marks the slot lost. Any grid size >= 1.
+ * @param p Batch parameters
+ * @param b Batch buffers
+ * @param round Round of the queues, 1..8
+*/
+PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
+   kcu_peach_pipe_scatter(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b,
+   int round)
+{
+   const word32 rr = (word32) round;
+   const word32 *cnt;
+   word32 *cur = b.d_cnt + PEACH_PIPE_CUROFF;
+   word32 qoff[8], k, key, a, i, pos;
+   uint4 e;
+
+   if (rr < 1 || rr > PEACHROUNDS) return;
+   /* queue offsets of the round (constant indices: registers) */
+   cnt = b.d_cnt + (rr * 8 * PEACH_PIPE_CNTPAD);
+   qoff[0] = 0;
+   PEACH_PIPE_UNROLL
+   for (i = 1; i < 8; i++) {
+      qoff[i] = qoff[i - 1] + PEACH_LDG32(&cnt[(i - 1) * PEACH_PIPE_CNTPAD]);
+   }
+   for (k = (blockIdx.x * blockDim.x) + threadIdx.x; k < p.nslots;
+         k += gridDim.x * blockDim.x) {
+      key = b.d_key[k];
+      if (key == PEACH_PIPE_KEYDEAD) continue;
+      a = (key >> PEACH_PIPE_KEYSHIFT) & 7;
+      pos = 0;
+      PEACH_PIPE_UNROLL
+      for (i = 1; i < 8; i++) {
+         if (i == a) pos = qoff[i];
+      }
+      pos += PEACH_ATOMIC_ADD32(&cur[(a * PEACH_PIPE_NBUCKET) +
+         ((key & PEACHCACHELEN_M1) >> PEACH_PIPE_SORT_SHIFT)], 1);
+      if (pos < b.cap) {
+         e = PEACH_LDG128(&b.d_slot[k]);
+         e.z = (e.z & ~((word32) PEACHCACHELEN_M1)) |
+            (key & PEACHCACHELEN_M1);
+         *((uint4 *) &b.d_ent[pos]) = e;
+      } else {
+         PEACH_ATOMIC_ADD32(&b.d_res->overflow, 1);
+         b.d_key[k] = PEACH_PIPE_KEYDEAD;
+         if (b.d_trace != NULL) b.d_trace[k].drop_round = PEACH_PIPE_LOST;
+      }
+   }
+}  /* end kcu_peach_pipe_scatter() */
+
+/**
  * CUDA kernel finishing a batch: for each final queue entry, final =
  * sha256(hash0 || tile[mario]); counts completed nonces (per warp);
  * entry 0 writes the canary (nonce words 4..7 and final hash); the first
@@ -758,29 +1036,31 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
 PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
    kcu_peach_pipe_final(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b)
 {
-   const word32 *fq = b.d_q + (PEACH_PIPE_FINALQ * b.cap);
    PEACH_PIPE_RESULT *res = b.d_res;
-   word32 h0[8], out[8], n, base, k, slot, m;
-   uint4 v, nv;
+   word32 h0[8], out[8], n4[4], n, base, k, slot, m;
+   uint4 v, w, nv;
    int valid, i;
 
    if (blockIdx.x == 0 && threadIdx.x == 0) res->epoch = p.epoch;
-   n = PEACH_LDG32(&b.d_cnt[PEACH_PIPE_FINALCNT * PEACH_PIPE_CNTPAD]);
-   if (n > b.cap) n = b.cap;
+   n = peach_pipe_qlen(PEACH_LDG32(&b.d_cnt[PEACH_PIPE_FINALCNT *
+      PEACH_PIPE_CNTPAD]), 0, b.cap);
    for (base = blockIdx.x * blockDim.x; base < n;
          base += gridDim.x * blockDim.x) {
       k = base + threadIdx.x;
       valid = (k < n);
       if (valid) {
-         slot = PEACH_LDG32(&fq[k]);
+         /* final queue entry: nonce words 4..7, final tile, slot */
+         w = PEACH_LDG128(&b.d_ent[k]);
+         peach_pipe_frame(((word64) w.y << 32) | w.x, n4);
+         nv.x = n4[0]; nv.y = n4[1]; nv.z = n4[2]; nv.w = n4[3];
+         m = w.z & PEACHCACHELEN_M1;
+         slot = w.w;
          v = PEACH_LDG128(&b.d_hash[slot * 8]);
          h0[0] = v.x; h0[1] = v.y; h0[2] = v.z; h0[3] = v.w;
          v = PEACH_LDG128(&b.d_hash[(slot * 8) + 4]);
          h0[4] = v.x; h0[5] = v.y; h0[6] = v.z; h0[7] = v.w;
-         m = PEACH_LDG32(&b.d_slot[slot].mario);
          peach_sha256_final(h0, &b.d_map[(size_t) m * PEACH_PIPE_TILEVEC],
             out);
-         nv = PEACH_LDG128(b.d_slot[slot].nonce);
          if (b.d_trace != NULL) {
             PEACH_PIPE_UNROLL
             for (i = 0; i < 8; i++) b.d_trace[slot].final[i] = out[i];
@@ -882,11 +1162,36 @@ PEACH_HOST void peach_pipe_launch_hash(int algo, int grid, int block,
 }  /* end peach_pipe_launch_hash() */
 
 /**
- * Enqueue one pipeline batch on a stream: zero the counters and the
- * result, then init, the hash kernels of every round for each algorithm
- * not in that round's skip mask, and final. Shared by peach.cu and the
- * CPU tests (emulated launches run synchronously). The caller copies
- * the result back after the stream completes.
+ * @private
+ * Launch the tile sort of the queues of round @a round (1..7; 8: the
+ * final queue): kcu_peach_pipe_scan(), then kcu_peach_pipe_scatter()
+ * (grid l->grid_init, as the init kernel: one item per slot).
+ * @note Internal to peach_pipe_enqueue() (validated launch shape).
+ * @returns cudaSuccess, or the error of a failed launch
+*/
+PEACH_HOST cudaError_t peach_pipe_launch_sort(const PEACH_PIPE_PARAMS *p,
+   const PEACH_PIPE_BUFS *b, const PEACH_PIPE_LAUNCH *l, int round,
+   cudaStream_t s)
+{
+   cudaError_t err;
+
+   CUDA_KERNEL(kcu_peach_pipe_scan, PEACH_PIPE_SCANGRID, PEACH_PIPE_BLOCK,
+      0, s)(*b, round);
+   err = cudaGetLastError();
+   if (err != cudaSuccess) return err;
+   CUDA_KERNEL(kcu_peach_pipe_scatter, l->grid_init, l->block, 0, s)
+      (*p, *b, round);
+   return cudaGetLastError();
+}  /* end peach_pipe_launch_sort() */
+
+/**
+ * Enqueue one pipeline batch on a stream: zero the counters, histograms
+ * and the result, then init, for every round the tile sort of its queues
+ * (rounds 1..7) and the hash kernels for each algorithm not in that
+ * round's skip mask, then the tile sort of the final queue and final.
+ * Shared by peach.cu and the CPU tests (emulated launches run
+ * synchronously). The caller copies the result back after the stream
+ * completes.
  * @param p Batch parameters (nslots <= b->cap; p->epoch > 0)
  * @param b Batch buffers (cap 1..PEACH_PIPE_MAXCAP)
  * @param l Launch configuration (block: a multiple of 32, at most
@@ -919,7 +1224,7 @@ PEACH_HOST int peach_pipe_enqueue(const PEACH_PIPE_PARAMS *p,
    }
 
    err = PEACH_MEMSET_ASYNC(b->d_cnt, 0,
-      sizeof(word32) * PEACH_PIPE_NCNT * PEACH_PIPE_CNTPAD, s);
+      sizeof(word32) * PEACH_PIPE_CNTZERO, s);
    if (err != cudaSuccess) return (int) err;
    err = PEACH_MEMSET_ASYNC(b->d_res, 0, sizeof(PEACH_PIPE_RESULT), s);
    if (err != cudaSuccess) return (int) err;
@@ -927,6 +1232,10 @@ PEACH_HOST int peach_pipe_enqueue(const PEACH_PIPE_PARAMS *p,
    err = cudaGetLastError();
    if (err != cudaSuccess) return (int) err;
    for (r = 0; r < PEACHROUNDS; r++) {
+      if (r > 0) {
+         err = peach_pipe_launch_sort(p, b, l, r, s);
+         if (err != cudaSuccess) return (int) err;
+      }
       mask = peach_pipe_skip_mask(p->skip, (word32) r);
       for (a = 0; a < 8; a++) {
          if ((mask >> a) & 1) continue;
@@ -935,6 +1244,8 @@ PEACH_HOST int peach_pipe_enqueue(const PEACH_PIPE_PARAMS *p,
          if (err != cudaSuccess) return (int) err;
       }
    }
+   err = peach_pipe_launch_sort(p, b, l, PEACHROUNDS, s);
+   if (err != cudaSuccess) return (int) err;
    CUDA_KERNEL(kcu_peach_pipe_final, l->grid_final, l->block, 0, s)
       (*p, *b);
    err = cudaGetLastError();
