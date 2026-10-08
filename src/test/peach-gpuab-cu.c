@@ -184,7 +184,8 @@ static double run_config(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
    const BTRAILER *bt_in, double seconds, word32 poll_ms, int keepenv)
 {
    BTRAILER bt, btout;
-   double t0, tstart, elapsed, build, rate, expect;
+   double t0, tstart, elapsed, build, rate, expect, tfirst, tlast, steady;
+   size_t wfirst, wlast;
    unsigned long solves;
    int ecode, ok;
 
@@ -248,8 +249,21 @@ static double run_config(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
    solves = 0;
    tstart = now_sec();
    elapsed = 0.0;
+   tfirst = tlast = -1.0;
+   wfirst = wlast = dev->work;
    while (ok && (elapsed = now_sec() - tstart) < seconds) {
       ecode = peach_solve_cuda(dev, &bt, 0, &btout);
+      /* steady rate: work between the first and the last harvest, which
+       * is not quantized to whole batches per window like dev->work over
+       * the solving time */
+      if (dev->work != wlast) {
+         tlast = now_sec();
+         if (tfirst < 0.0) {
+            tfirst = tlast;
+            wfirst = dev->work;
+         }
+         wlast = dev->work;
+      }
       if (ecode == VETIMEOUT || dev->status < DEV_NULL) {
          printf("FAIL: device failed while solving (status %d)\n",
             dev->status);
@@ -283,11 +297,15 @@ static double run_config(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
    if (ok) ok = check_solver(dev, cfg, "after solving");
 
    rate = elapsed > 0.0 ? (double) dev->work / elapsed : 0.0;
+   steady = tlast > tfirst && tfirst >= 0.0 ?
+      (double) (wlast - wfirst) / (tlast - tfirst) : 0.0;
    expect = (double) dev->work / (double) (1ULL << bt.difficulty[0]);
    if (ok) {
       printf("   map %.1f s; %.3f M completed nonces/s over %.1f s;"
          " %lu solves verified (expected ~%.1f)\n", build, rate / 1e6,
          elapsed, solves, expect);
+      printf("   steady %.3f M completed nonces/s (first to last harvest,"
+         " %.1f s)\n", steady / 1e6, tlast - tfirst);
       if (solves == 0 && expect >= MIN_EXPECTED) {
          printf("FAIL: no solves, ~%.0f expected\n", expect);
          ok = 0;
