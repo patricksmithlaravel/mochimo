@@ -121,7 +121,9 @@ int peach_solve(const BTRAILER *bt, word8 diff, void *out);
 
 /* CUDA functions */
 int peach_checkhash_cuda(int count, BTRAILER bt[], void *out);
+int peach_free_cuda_device(DEVICE_CTX *devp);
 int peach_init_cuda_device(DEVICE_CTX *devp);
+int peach_pipeline_cuda_device(const DEVICE_CTX *devp);
 int peach_solve_cuda(DEVICE_CTX *dev, BTRAILER *bt, word8 diff, BTRAILER *out);
 
 #ifdef __cplusplus
