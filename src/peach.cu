@@ -47,7 +47,10 @@
 
 /* Pipeline batch sizing (see peach_cuda_sizing()) */
 #define PEACH_CUDA_NCTX_MAX         4  /**< max. batch contexts, one
-   stream each; automatic: as many as memory allows for full batches */
+   stream each (MCM_PEACH_STREAMS) */
+#define PEACH_CUDA_NCTX_AUTO        3  /**< batch contexts of the automatic
+   choice, fewer (not below PEACH_CUDA_NCTX_MIN) when the free memory
+   does not fit full batches for them */
 #define PEACH_CUDA_NCTX_MIN         2  /**< min. batch contexts of the
    automatic choice */
 #define PEACH_CUDA_SLOT_BYTES       ( 2 * sizeof(PEACH_PIPE_SLOT) + \
@@ -55,14 +58,13 @@
    PEACH_PIPE_NQUEUE * sizeof(word32) )   /**< device bytes per slot and
    context: slot state 16 + queue entry 16 + hash0 32 + rng 8 + key 4 +
    8 round 0 queues x 4 = 108 */
-#define PEACH_CUDA_SLOTS_PER_THREAD 32 /**< default slots in flight per
-   resident thread, over all batch contexts (N = 32 x SMs x
-   maxThreadsPerSM / contexts): the GPU work queued between two polls of
-   the caller does not depend on the number of contexts */
-#define PEACH_CUDA_MD2_SHARE        3  /**< with 3 or more contexts, the
-   MD2 hash kernel (compute bound) runs 1/3 of its resident blocks per
-   multiprocessor (at least one), so that the (memory bound) kernels of
-   the other contexts share the multiprocessors with it */
+#define PEACH_CUDA_SLOTS_PER_THREAD 32 /**< default slots per batch (each
+   batch context) per resident thread: N = 32 x SMs x maxThreadsPerSM.
+   Large batches fill the tile ordered queues densely, so that jumps to
+   neighbouring tiles share cache lines */
+#define PEACH_CUDA_MD2_BLOCKS       4  /**< max. resident blocks per SM of
+   the MD2 hash kernel (fewer than its occupancy allows, see
+   peach_cuda_pipeline_setup()) */
 #define PEACH_CUDA_MEM_PERCENT      80 /**< max. share of free memory used
    by the batch contexts, in percent */
 #define PEACH_CUDA_BATCH_MAX        WORD32_C(0x1000000)  /**< hard upper
@@ -99,6 +101,11 @@
 #define PEACH_CUDA_SELFTEST_BYTES   ( sizeof(word32) * \
    PEACH_CUDA_SELFTEST_MAX * (PEACH_PIPE_SELFTEST_IN + \
    PEACH_PIPE_SELFTEST_OUT) )   /**< self-test buffer (in, then out) */
+#define PEACH_CUDA_SKIP_LATE_CC     12   /**< compute capability (major)
+   whose default skip masks evaluate MD2 jumps in the late rounds (see
+   peach_cuda_skip_default()); measured on sm_120 (RTX 5090) only */
+#define PEACH_CUDA_SKIP_LATE_ROUND  4    /**< first round of the late-MD2
+   default skip masks that keeps MD2 jumps (rounds 0..3 drop them) */
 
 /* Block trailer snapshot attempts (see peach_cuda_snapshot()) */
 #define PEACH_CUDA_SNAPSHOT_TRIES   64
@@ -127,6 +134,9 @@ typedef struct {
    /* configuration, read once by peach_init_cuda_device() */
    int cfg_legacy;                     /**< MCM_PEACH_LEGACY (1 = legacy) */
    word8 cfg_skip[8];                  /**< MCM_PEACH_SKIP, per round */
+   int cfg_skip_auto;                  /**< MCM_PEACH_SKIP unset: default
+                                          masks of the device (see
+                                          peach_cuda_skip_default()) */
    word32 cfg_batch;                   /**< MCM_PEACH_BATCH (0 = auto) */
    int cfg_nctx;                       /**< MCM_PEACH_STREAMS (0 = auto) */
    /* solver mode and safety */
@@ -1127,7 +1137,7 @@ static int peach_cuda_parse_uint(const char *s, const char *e,
  *   per-round skip masks of the pipeline solver: bit a drops a nonce
  *   whose jump in that round would use algorithm a (6 = MD2). One mask
  *   applies to all 8 rounds. Each mask 0..0xFE (0xFF would drop every
- *   nonce); default 0x40 in every round;
+ *   nonce); default automatic, per device (peach_cuda_skip_default());
  * - MCM_PEACH_BATCH=<slots> -- slots per pipeline batch, 0 = automatic;
  *   default 0 (see peach_cuda_sizing() for clamping);
  * - MCM_PEACH_STREAMS=<n> -- pipeline batch contexts (one stream each),
@@ -1147,6 +1157,7 @@ static void peach_cuda_config(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
    /* defaults */
    P->cfg_legacy = 0;
    for (i = 0; i < 8; i++) P->cfg_skip[i] = PEACH_PIPE_SKIP_MD2;
+   P->cfg_skip_auto = 1;
    P->cfg_batch = 0;
    P->cfg_nctx = 0;
 
@@ -1177,6 +1188,7 @@ static void peach_cuda_config(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
       if (n == 1) for (i = 1; i < 8; i++) masks[i] = masks[0];
       if (n == 1 || n == 8) {
          for (i = 0; i < 8; i++) P->cfg_skip[i] = (word8) masks[i];
+         P->cfg_skip_auto = 0;
       } else {
          pwarn("CUDA #%d: ignoring invalid MCM_PEACH_SKIP=\"%.80s\""
             " (expected 1 or 8 comma separated masks, each 0..0xFE)",
@@ -1212,17 +1224,58 @@ static void peach_cuda_config(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
 
 /**
  * @private
+ * Default (automatic) skip masks of the pipeline solver for the current
+ * CUDA device, used when MCM_PEACH_SKIP is unset (or invalid): on
+ * devices of compute capability PEACH_CUDA_SKIP_LATE_CC.x, MD2 jumps are
+ * dropped in rounds 0..PEACH_CUDA_SKIP_LATE_ROUND - 1 and evaluated in
+ * the later rounds (masks 0x40 x 4, then 0x00 x 4); on every other
+ * device (not measured), MD2 jumps are dropped in every round (0x40 x 8).
+ * <br />
+ * An MD2 jump costs several other jumps, and dropping a nonce loses the
+ * jumps already spent on it. Early in its walk a nonce has cost little
+ * and most of its walk is still ahead, so dropping it and starting a
+ * fresh one is cheaper; late in its walk, finishing it with the MD2 jump
+ * is cheaper. A drop in round 0 costs only the init kernel (95% of
+ * nonces start on tile 0, and for some blocks about half of them jump
+ * with MD2 there). Measured on an RTX 5090 (sm_120) with the GPU A/B
+ * test: 79 M completed nonces/s with 0x40 x 4, 0x00 x 4, against 69 with
+ * 0x40 in every round and 73 with full evaluation (0x00).
+ * @param ctx Pointer to DEVICE_CTX (current CUDA device)
+ * @param P Pointer to Peach CUDA context (cfg_skip, cfg_skip_auto)
+ * @returns compute capability (major) of the device, 0 if unknown
+*/
+static int peach_cuda_skip_default(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
+{
+   int major = 0, i;
+
+   if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+         ctx->id) != cudaSuccess) {
+      /* clear the (non-sticky) error; keep the generic masks */
+      (void) cudaGetLastError();
+      major = 0;
+   }
+   if (P->cfg_skip_auto && major == PEACH_CUDA_SKIP_LATE_CC) {
+      for (i = 0; i < 8; i++) {
+         P->cfg_skip[i] = i < PEACH_CUDA_SKIP_LATE_ROUND ?
+            PEACH_PIPE_SKIP_MD2 : 0;
+      }
+   }
+
+   return major;
+}  /* end peach_cuda_skip_default() */
+
+/**
+ * @private
  * Size the pipeline batch contexts of the current CUDA device. Slots per
- * batch N = PEACH_CUDA_SLOTS_PER_THREAD x SMs x maxThreadsPerSM / batch
- * contexts, or MCM_PEACH_BATCH when set, clamped to [128 x SMs, memory
- * limit] and
+ * batch N = PEACH_CUDA_SLOTS_PER_THREAD x SMs x maxThreadsPerSM, or
+ * MCM_PEACH_BATCH when set, clamped to [128 x SMs, memory limit] and
  * rounded to whole blocks of 128 slots; the memory limit wins when both
  * bounds conflict. The memory limit fits the batch contexts, of
  * PEACH_CUDA_SLOT_BYTES per slot each, into PEACH_CUDA_MEM_PERCENT
  * percent of the free device memory, minus @a reserve bytes still to be
  * allocated, and never exceeds PEACH_CUDA_BATCH_MAX slots. Batch
  * contexts: MCM_PEACH_STREAMS when set, else the most of
- * PEACH_CUDA_NCTX_MAX .. PEACH_CUDA_NCTX_MIN whose memory limit still
+ * PEACH_CUDA_NCTX_AUTO .. PEACH_CUDA_NCTX_MIN whose memory limit still
  * fits N (else PEACH_CUDA_NCTX_MIN, with a smaller N).
  * Sets P->sms, P->max_threads_sm, P->nctx, P->cap, P->nslots and
  * P->nslots_min.
@@ -1269,10 +1322,9 @@ static int peach_cuda_sizing(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P,
     * block per SM */
    lo = (word32) P->sms * PEACH_PIPE_BLOCK;
    avail = mfree > reserve ? mfree - reserve : 0;
-   for (nctx = P->cfg_nctx ? P->cfg_nctx : PEACH_CUDA_NCTX_MAX; ; nctx--) {
-      want = P->cfg_batch ? (word64) P->cfg_batch : (word64) P->sms *
-         (word64) P->max_threads_sm * PEACH_CUDA_SLOTS_PER_THREAD /
-         (word64) nctx;
+   want = P->cfg_batch ? (word64) P->cfg_batch : (word64) P->sms *
+      (word64) P->max_threads_sm * PEACH_CUDA_SLOTS_PER_THREAD;
+   for (nctx = P->cfg_nctx ? P->cfg_nctx : PEACH_CUDA_NCTX_AUTO; ; nctx--) {
       n = want < lo ? lo : want;
       n = (n + PEACH_PIPE_BLOCK - 1) & ~((word64) PEACH_PIPE_BLOCK - 1);
       if (n > PEACH_CUDA_BATCH_MAX) n = PEACH_CUDA_BATCH_MAX;
@@ -1403,7 +1455,7 @@ static int peach_cuda_grid(const PEACH_CUDA_CTX *P, int blocks)
  * result, timing events), seed the RNG states of each context (distinct
  * seeds, exactly cap threads) and compute the grid of every pipeline
  * kernel from its occupancy: one wave of resident blocks, except the MD2
- * kernel with 3 or more contexts (see PEACH_CUDA_MD2_SHARE).
+ * kernel (at most PEACH_CUDA_MD2_BLOCKS blocks per SM).
  * @param ctx Pointer to DEVICE_CTX (current CUDA device)
  * @param P Pointer to Peach CUDA context
  * @returns VEOK on success, else VERROR (warned); the caller then
@@ -1524,13 +1576,15 @@ static int peach_cuda_pipeline_setup(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
          return VERROR;
       }
    }
+   /* MD2 is bound by the rate of shared memory loads and a hash takes
+    * about 1 ms per thread, the other hash kernels are bound by memory:
+    * fewer resident MD2 blocks per SM than its occupancy leave room on
+    * every SM for the kernels of the other batch contexts (RTX 5090,
+    * full evaluation: 4 instead of 5 blocks per SM gave +8% completed
+    * nonces/s; 2 or 3 blocks were slower) */
+   if (nb[6] > PEACH_CUDA_MD2_BLOCKS) nb[6] = PEACH_CUDA_MD2_BLOCKS;
    P->launch.block = PEACH_PIPE_BLOCK;
    for (i = 0; i < 8; i++) P->launch.grid_hash[i] = peach_cuda_grid(P, nb[i]);
-   if (P->nctx >= 3) {
-      /* MD2 shares the multiprocessors with the other contexts */
-      i = nb[6] / PEACH_CUDA_MD2_SHARE;
-      P->launch.grid_hash[6] = peach_cuda_grid(P, i > 1 ? i : 1);
-   }
    P->launch.grid_init = peach_cuda_grid(P, nb[8]);
    P->launch.grid_final = peach_cuda_grid(P, nb[9]);
 
@@ -1696,8 +1750,8 @@ int peach_init_cuda_device(DEVICE_CTX *ctx)
    PEACH_CUDA_CTX *p_ctx;
    const char *reason;
    size_t btsz, seedsz;
-   int grid, block, i;
-   char skip[48], batch[16], streams[16];
+   int grid, block, major, i, n;
+   char skip[96], batch[16], streams[16];
 
 #undef cuCHK
 #define cuCHK(cuFN) \
@@ -1737,6 +1791,8 @@ int peach_init_cuda_device(DEVICE_CTX *ctx)
 
    /* set context to CUDA id */
    cuCHK(cudaSetDevice(ctx->id));
+   /* device dependent default skip masks (MCM_PEACH_SKIP unset) */
+   major = peach_cuda_skip_default(ctx, p_ctx);
    /* determine CUDA occupancy for device */
    cuCHK(cudaOccupancyMaxPotentialBlockSize(&grid, &block, kcu_peach_solve, 0, 0));
    /* store grid/block and calculate threads and state sizes */
@@ -1801,15 +1857,23 @@ int peach_init_cuda_device(DEVICE_CTX *ctx)
    for (i = 1; i < 8; i++) {
       if (p_ctx->cfg_skip[i] != p_ctx->cfg_skip[0]) break;
    }
+   /* (automatic masks: "auto(cc <major>: <masks>)") */
+   n = 0;
+   if (p_ctx->cfg_skip_auto) {
+      n = snprintf(skip, sizeof(skip), "auto(cc %d: ", major);
+      if (n < 0 || n >= (int) sizeof(skip)) n = 0;
+   }
    if (i == 8) {
-      snprintf(skip, sizeof(skip), "0x%02x", (unsigned) p_ctx->cfg_skip[0]);
+      snprintf(skip + n, sizeof(skip) - (size_t) n, "0x%02x%s",
+         (unsigned) p_ctx->cfg_skip[0], p_ctx->cfg_skip_auto ? ")" : "");
    } else {
-      snprintf(skip, sizeof(skip),
-         "0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x",
+      snprintf(skip + n, sizeof(skip) - (size_t) n,
+         "0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x%s",
          (unsigned) p_ctx->cfg_skip[0], (unsigned) p_ctx->cfg_skip[1],
          (unsigned) p_ctx->cfg_skip[2], (unsigned) p_ctx->cfg_skip[3],
          (unsigned) p_ctx->cfg_skip[4], (unsigned) p_ctx->cfg_skip[5],
-         (unsigned) p_ctx->cfg_skip[6], (unsigned) p_ctx->cfg_skip[7]);
+         (unsigned) p_ctx->cfg_skip[6], (unsigned) p_ctx->cfg_skip[7],
+         p_ctx->cfg_skip_auto ? ")" : "");
    }
    if (p_ctx->cfg_batch) {
       snprintf(batch, sizeof(batch), "%lu", (unsigned long) p_ctx->cfg_batch);
