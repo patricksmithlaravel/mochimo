@@ -37,6 +37,9 @@
  * - PEACH_GPUAB_DEBUG=1: debug logging (e.g. pipeline batch sizing)
  * - PEACH_GPUAB_POLL_MS: milliseconds between two solver calls (default
  *   1; gpuminer polls every 10 ms by default)
+ * - PEACH_GPUAB_PHASH=<n>: 1..1000000 changes the previous block hash
+ *   of the trailer (another Peach map, so other round 0 algorithms);
+ *   default 0, the block 1 trailer as is
  * - PEACH_GPUAB_ONLY=<label>: run only the configuration with this label
  *   (e.g. "pipeline"); its default and automatic settings then come from
  *   the caller's MCM_PEACH_SKIP, MCM_PEACH_BATCH and MCM_PEACH_STREAMS
@@ -311,6 +314,8 @@ int main(void)
    double rate[NCONFIG], seconds;
    cudaError_t err;
    word32 seed, poll_ms;
+   word64 z;
+   long phash;
    const char *only;
    int count, devidx, i, sweep, fails, found;
    long diff;
@@ -336,6 +341,7 @@ int main(void)
    devidx = (int) env_long("PEACH_GPUAB_DEVICE", 0, 0, GPUMAX - 1);
    sweep = (int) env_long("PEACH_GPUAB_SWEEP", 1, 0, 1);
    poll_ms = (word32) env_long("PEACH_GPUAB_POLL_MS", 1, 1, 1000);
+   phash = env_long("PEACH_GPUAB_PHASH", 0, 0, 1000000);
    if (env_long("PEACH_GPUAB_DEBUG", 0, 0, 1)) setploglevel(PLOG_DEBUG);
    only = getenv("PEACH_GPUAB_ONLY");
    if (only != NULL && *only == '\0') only = NULL;
@@ -362,6 +368,17 @@ int main(void)
    srand16(seed, seed ^ 0x5a5a5a5a, seed ^ 0xa5a5a5a5);
    memcpy(&bt, Block1, sizeof(bt));
    bt.difficulty[0] = (word8) diff;
+   if (phash > 0) {
+      /* another previous block hash (SplitMix64 stream of n) */
+      z = (word64) phash;
+      for (i = 0; i < (int) sizeof(bt.phash); i++) {
+         z += WORD64_C(0x9e3779b97f4a7c15);
+         bt.phash[i] ^= (word8) (((z ^ (z >> 31)) *
+            WORD64_C(0xbf58476d1ce4e5b9)) >> 56);
+      }
+      printf("GPU A/B: previous block hash variant %ld: %02x%02x%02x%02x..\n",
+         phash, bt.phash[0], bt.phash[1], bt.phash[2], bt.phash[3]);
+   }
 
    fails = 0;
    for (i = 0; i < NCONFIG; i++) {
