@@ -4,20 +4,29 @@
  * @details GPU only; without a usable CUDA device the test is skipped
  * (exit 0). For each configuration, one CUDA device is initialized with
  * peach_init_cuda_device() under that configuration's environment
- * (MCM_PEACH_LEGACY, MCM_PEACH_SKIP), the Peach map is built, and the
+ * (MCM_PEACH_LEGACY, MCM_PEACH_SKIP, MCM_PEACH_BATCH), the Peach map is
+ * built (with the transition table and self-test of the pipeline), and the
  * solver runs for a fixed time on the same block trailer at a moderate
  * difficulty. Every reported solve must belong to that trailer and pass
- * peach_check(). The device is released with peach_free_cuda_device()
- * between configurations. Reports completed nonces per second (work
- * counted by the solver over the solving time) and the speedup over the
- * legacy solver. Time bounded: map build <= 300 s, solving as below.
+ * peach_check(). The solver in use is checked with
+ * peach_pipeline_cuda_device() after initialization, after the map build
+ * and after solving: a pipeline configuration fails if the device uses
+ * the legacy solver (failed pipeline setup, or a fallback after a self-
+ * test, canary or verification failure). The device is released with
+ * peach_free_cuda_device() between configurations. Reports completed
+ * nonces per second (work counted by the solver over the solving time)
+ * and the speedup over the legacy solver. Configurations: legacy,
+ * pipeline (defaults), then pipeline variants: full evaluation (skip
+ * mask 0), mixed per-round skip masks, a wider skip mask, and the
+ * smallest batch size. Time bounded: map build <= 300 s, solving as
+ * below.
  * <br />
  * Optional environment:
  * - PEACH_GPUAB_SECONDS: solving time per configuration (default 20,
  *   at most 180 so the trailer cannot expire while solving)
  * - PEACH_GPUAB_DIFF: difficulty (default 24)
  * - PEACH_GPUAB_DEVICE: CUDA device index (default 0)
- * - PEACH_GPUAB_SWEEP=1: also run pipeline MCM_PEACH_SKIP variants
+ * - PEACH_GPUAB_SWEEP=0: skip the pipeline variants (default 1)
  * - PEACH_GPUAB_DEBUG=1: debug logging (e.g. pipeline batch sizing)
 */
 
@@ -69,16 +78,18 @@ typedef struct {
    const char *name;    /* label */
    const char *legacy;  /* MCM_PEACH_LEGACY */
    const char *skip;    /* MCM_PEACH_SKIP, or NULL (unset: default) */
-   int sweep;           /* run only with PEACH_GPUAB_SWEEP=1 */
+   const char *batch;   /* MCM_PEACH_BATCH, or NULL (unset: automatic) */
+   int sweep;           /* pipeline variant (skipped with SWEEP=0) */
 } GPUAB_CONFIG;
 
 static const GPUAB_CONFIG Config[] = {
-   { "legacy", "1", NULL, 0 },
-   { "pipeline", "0", NULL, 0 },
-   { "pipeline skip=0x00", "0", "0", 1 },
+   { "legacy", "1", NULL, NULL, 0 },
+   { "pipeline", "0", NULL, NULL, 0 },
+   { "pipeline skip=0x00", "0", "0", NULL, 1 },
    { "pipeline skip=0x00,0x40x7", "0",
-      "0,0x40,0x40,0x40,0x40,0x40,0x40,0x40", 1 },
-   { "pipeline skip=0x70", "0", "0x70", 1 }
+      "0,0x40,0x40,0x40,0x40,0x40,0x40,0x40", NULL, 1 },
+   { "pipeline skip=0x70", "0", "0x70", NULL, 1 },
+   { "pipeline batch=min", "0", NULL, "1", 1 }
 };
 
 #define NCONFIG   ((int) (sizeof(Config) / sizeof(Config[0])))
@@ -114,6 +125,27 @@ static long env_long(const char *name, long def, long min, long max)
 }
 
 /**
+ * Check that device @a dev uses the solver of configuration @a cfg.
+ * @returns 1 if it does, else 0 (reported as a failure)
+*/
+static int check_solver(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
+   const char *when)
+{
+   int want = strcmp(cfg->legacy, "1") ? 1 : 0;
+   int mode = peach_pipeline_cuda_device(dev);
+
+   if (mode == want) return 1;
+   if (mode < 0) printf("FAIL: %s: device has no Peach context\n", when);
+   else {
+      printf("FAIL: %s: device uses the %s solver, expected the %s"
+         " solver\n", when, mode ? "pipeline" : "legacy",
+         want ? "pipeline" : "legacy");
+   }
+
+   return 0;
+}
+
+/**
  * Run one solver configuration on device @a dev.
  * @returns completed nonces per second, or a negative value on failure
 */
@@ -129,15 +161,18 @@ static double run_config(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
    setenv("MCM_PEACH_LEGACY", cfg->legacy, 1);
    if (cfg->skip) setenv("MCM_PEACH_SKIP", cfg->skip, 1);
    else unsetenv("MCM_PEACH_SKIP");
-   unsetenv("MCM_PEACH_BATCH");
+   if (cfg->batch) setenv("MCM_PEACH_BATCH", cfg->batch, 1);
+   else unsetenv("MCM_PEACH_BATCH");
 
    /* fresh trailer: not expired, not solved (btout bnum differs) */
    memcpy(&bt, bt_in, sizeof(bt));
    put32(bt.time0, (word32) time(NULL));
    memset(&btout, 0, sizeof(btout));
 
-   printf("== %s (MCM_PEACH_LEGACY=%s MCM_PEACH_SKIP=%s)\n", cfg->name,
-      cfg->legacy, cfg->skip ? cfg->skip : "<default>");
+   printf("== %s (MCM_PEACH_LEGACY=%s MCM_PEACH_SKIP=%s"
+      " MCM_PEACH_BATCH=%s)\n", cfg->name, cfg->legacy,
+      cfg->skip ? cfg->skip : "<default>",
+      cfg->batch ? cfg->batch : "<auto>");
    fflush(stdout);
    if (peach_init_cuda_device(dev) != VEOK) {
       printf("FAIL: peach_init_cuda_device()\n");
@@ -146,9 +181,9 @@ static double run_config(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
    }
 
    /* build the Peach map (DEV_INIT -> DEV_IDLE -> DEV_WORK) */
-   ok = 1;
+   ok = check_solver(dev, cfg, "after initialization");
    t0 = now_sec();
-   while (dev->status != DEV_WORK) {
+   while (ok && dev->status != DEV_WORK) {
       /* keep time0 fresh until solving starts, so a slow map build cannot
        * expire the trailer (BRIDGEv3) before the IDLE -> WORK gate */
       put32(bt.time0, (word32) time(NULL));
@@ -172,6 +207,8 @@ static double run_config(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
       millisleep(1);
    }
    build = now_sec() - t0;
+   /* the pipeline self-test runs at the end of the map build */
+   if (ok) ok = check_solver(dev, cfg, "after the map build");
 
    /* solve for a fixed time, verify every solve */
    solves = 0;
@@ -202,11 +239,14 @@ static double run_config(DEVICE_CTX *dev, const GPUAB_CONFIG *cfg,
       }
       if (dev->status != DEV_WORK) {
          printf("FAIL: device left DEV_WORK (status %d)\n", dev->status);
+         check_solver(dev, cfg, "after leaving DEV_WORK");
          ok = 0;
          break;
       }
       millisleep(1);
    }
+   /* a pipeline defect would have switched to the legacy solver */
+   if (ok) ok = check_solver(dev, cfg, "after solving");
 
    rate = elapsed > 0.0 ? (double) dev->work / elapsed : 0.0;
    expect = (double) dev->work / (double) (1ULL << bt.difficulty[0]);
@@ -256,7 +296,7 @@ int main(void)
       MAX_SECONDS);
    diff = env_long("PEACH_GPUAB_DIFF", DEF_DIFF, 8, 48);
    devidx = (int) env_long("PEACH_GPUAB_DEVICE", 0, 0, GPUMAX - 1);
-   sweep = (int) env_long("PEACH_GPUAB_SWEEP", 0, 0, 1);
+   sweep = (int) env_long("PEACH_GPUAB_SWEEP", 1, 0, 1);
    if (env_long("PEACH_GPUAB_DEBUG", 0, 0, 1)) setploglevel(PLOG_DEBUG);
 
    memset(D, 0, sizeof(D));

@@ -56,4 +56,6 @@ jobs:
       - name: Build (CUDA, default architecture)
         run: make all
       - name: ptxas gate (kcu_peach_pipe_* kernels, no stack frame or spills)
+        env:
+          PEACH_GATE_MIN_KERNELS: 12
         run: .github/scripts/peach-ptxas-gate.sh 61 75 86 89 90 120
