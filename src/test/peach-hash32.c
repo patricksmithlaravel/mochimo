@@ -18,7 +18,11 @@
  * (3) peach_sha256_final() vs sha256(hash0 || tile);
  * (4) Peach walks (mainnet vectors, then random nonces on their maps):
  *     hash0, every SHA-1/SHA-256/MD5 jump and the final hash vs the
- *     reference; the mainnet vectors reproduce ref_peach_checkhash().
+ *     reference; the mainnet vectors reproduce ref_peach_checkhash();
+ * (5) the separate SHA-256 compressor with arbitrary chaining states vs
+ *     both the original compressor and crypto-c, including carry cases.
+ *     This checks the C fallback; the device instruction path needs the
+ *     separate CUDA golden test.
 */
 
 #include <stdio.h>
@@ -399,6 +403,53 @@ static void check_seed(void)
    }
 }
 
+/* (5) arbitrary-state compression: independent reference plus comparison
+ * of the overwritten message window, not just the final chaining state. */
+static void check_compress_imad(void)
+{
+   static const word32 edge[] = {
+      0, WORD32_C(0xffffffff), WORD32_C(0xaaaaaaaa),
+      WORD32_C(0x55555555), WORD32_C(0x7fffffff),
+      WORD32_C(0x80000000), WORD32_C(0xfffffffe), 1
+   };
+   SHA256_CTX ctx;
+   word32 state[8], base[8], out[8], w[16], wb[16], wi[16], block[16];
+   word64 bad = 0;
+   int i, j, ne = (int) (sizeof(edge) / sizeof(edge[0]));
+
+   for (i = 0; i < 4096 + ne * ne; i++) {
+      for (j = 0; j < 8; j++) {
+         state[j] = i < ne * ne ? edge[i / ne] : r32();
+      }
+      for (j = 0; j < 16; j++) {
+         w[j] = i < ne * ne ? edge[i % ne] : r32();
+         block[j] = peach_bswap32(w[j]);
+      }
+      sha256_init(&ctx);
+      memcpy(ctx.state, state, sizeof(state));
+      sha256_update(&ctx, block, sizeof(block));
+      memcpy(base, state, sizeof(base));
+      memcpy(out, state, sizeof(out));
+      memcpy(wb, w, sizeof(wb));
+      memcpy(wi, w, sizeof(wi));
+      peach_sha256_compress(base, wb);
+      peach_sha256_compress_imad(out, wi, 1);
+      if (memcmp(out, ctx.state, sizeof(out)) != 0 ||
+          memcmp(out, base, sizeof(out)) != 0 ||
+          memcmp(wi, wb, sizeof(wi)) != 0) {
+         if (bad++ == 0) {
+            printf("(5) compression mismatch, case %d:\n", i);
+            print_words("ref", ctx.state);
+            print_words("got", out);
+         }
+      }
+   }
+   printf("(5) compression: 4096 random + %d edge cases, mismatches %llu\n",
+      ne * ne, (unsigned long long) bad);
+   Fails += bad;
+   ASSERT_EQ((bad), (0));
+}
+
 /* reference inputs of peach_sha256_trailer() from a block trailer */
 static void trailer_inputs(const BTRAILER *bt, word32 *mid, word32 *tail,
    word32 *n)
@@ -607,6 +658,7 @@ int main(void)
    check_trailer();
    check_final();
    check_walks();
+   check_compress_imad();
    if (Fails) {
       printf("peach-hash32: %llu checks FAILED\n", (unsigned long long) Fails);
       return 1;

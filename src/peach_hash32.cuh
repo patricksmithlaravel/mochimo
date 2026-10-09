@@ -123,6 +123,89 @@ PEACH_DEV void peach_sha256_compress(word32 *st, word32 *w)
    st[4] += e; st[5] += f; st[6] += g; st[7] += h;
 }  /* end peach_sha256_compress() */
 
+/* Keep this multiplier mutable in device constant memory. Each jump/final
+ * hash reads it once, then shares the register across all 17 blocks. A
+ * compile-time 1 would let the assembler replace the multiply-add. */
+#ifdef __CUDACC__
+static PEACH_CONST word32 c_peach_sha256_one = 1;
+#endif
+
+PEACH_DEV word32 peach_sha256_add_imad(word32 x, word32 y, word32 one)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+   word32 sum;
+
+   asm("mad.lo.u32 %0, %1, %2, %3;"
+      : "=r"(sum) : "r"(x), "r"(one), "r"(y));
+   return sum;
+#else
+   (void) one;
+   return x + y;
+#endif
+}
+
+/* Move only the binary state/schedule additions; the three-input sums
+ * remain ordinary additions. With one == 1 the low product plus y is
+ * exactly x + y modulo 2^32, including carry out of the high bit. */
+#define PEACH_SHA256_IMAD_WS(i) \
+   (w[(i) & 15] = peach_sha256_add_imad(w[(i) & 15], \
+      PEACH_SHA256_SSIG1(w[((i) - 2) & 15]) + w[((i) - 7) & 15] + \
+      PEACH_SHA256_SSIG0(w[((i) - 15) & 15]), one))
+#define PEACH_SHA256_IMAD_RND(a, b, c, d, e, f, g, h, i, k, wm) \
+   h += PEACH_SHA256_BSIG1(e) + PEACH_SHA256_CH(e, f, g) + \
+      WORD32_C(k) + wm(i); \
+   d = peach_sha256_add_imad(d, h, one); \
+   h += PEACH_SHA256_BSIG0(a) + PEACH_SHA256_MAJ(a, b, c)
+#define PEACH_SHA256_IMAD_R8(i, k0, k1, k2, k3, k4, k5, k6, k7, wm) \
+   PEACH_SHA256_IMAD_RND(a, b, c, d, e, f, g, h, (i), k0, wm); \
+   PEACH_SHA256_IMAD_RND(h, a, b, c, d, e, f, g, (i) + 1, k1, wm); \
+   PEACH_SHA256_IMAD_RND(g, h, a, b, c, d, e, f, (i) + 2, k2, wm); \
+   PEACH_SHA256_IMAD_RND(f, g, h, a, b, c, d, e, (i) + 3, k3, wm); \
+   PEACH_SHA256_IMAD_RND(e, f, g, h, a, b, c, d, (i) + 4, k4, wm); \
+   PEACH_SHA256_IMAD_RND(d, e, f, g, h, a, b, c, (i) + 5, k5, wm); \
+   PEACH_SHA256_IMAD_RND(c, d, e, f, g, h, a, b, (i) + 6, k6, wm); \
+   PEACH_SHA256_IMAD_RND(b, c, d, e, f, g, h, a, (i) + 7, k7, wm)
+
+/* Jump/final compressor: 64 state and 48 schedule binary additions.
+ * Keep the trailer on the original compressor and its folded padding. */
+PEACH_DEV void peach_sha256_compress_imad(word32 *st, word32 *w,
+   word32 one)
+{
+   word32 a, b, c, d, e, f, g, h;
+
+   a = st[0]; b = st[1]; c = st[2]; d = st[3];
+   e = st[4]; f = st[5]; g = st[6]; h = st[7];
+   PEACH_SHA256_IMAD_R8(0, 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+      0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, PEACH_SHA256_W0);
+   PEACH_SHA256_IMAD_R8(8, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+      0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, PEACH_SHA256_W0);
+   PEACH_SHA256_IMAD_R8(16, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+      0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, PEACH_SHA256_IMAD_WS);
+   PEACH_SHA256_IMAD_R8(24, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+      0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, PEACH_SHA256_IMAD_WS);
+   PEACH_SHA256_IMAD_R8(32, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+      0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, PEACH_SHA256_IMAD_WS);
+   PEACH_SHA256_IMAD_R8(40, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+      0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, PEACH_SHA256_IMAD_WS);
+   PEACH_SHA256_IMAD_R8(48, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+      0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, PEACH_SHA256_IMAD_WS);
+   PEACH_SHA256_IMAD_R8(56, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+      0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2, PEACH_SHA256_IMAD_WS);
+   st[0] += a; st[1] += b; st[2] += c; st[3] += d;
+   st[4] += e; st[5] += f; st[6] += g; st[7] += h;
+}  /* end peach_sha256_compress_imad() */
+
+#undef PEACH_SHA256_IMAD_WS
+#undef PEACH_SHA256_IMAD_RND
+#undef PEACH_SHA256_IMAD_R8
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+   #define PEACH_SHA256_VIEW_COMPRESS(st, w) \
+      peach_sha256_compress_imad((st), (w), sha_one)
+#else
+   #define PEACH_SHA256_VIEW_COMPRESS(st, w) peach_sha256_compress((st), (w))
+#endif
+
 /**
  * @private
  * Resume a SHA-256 block at round 11 from normalized working variables.
@@ -525,17 +608,20 @@ PEACH_DEV void peach_sh_sha256(const word32 *n, word32 m, const uint4 *tile,
 {
    word32 st[8], w[16], carry;
    int k;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+   word32 sha_one = c_peach_sha256_one;
+#endif
 
    peach_sha256_iv(st);
    carry = peach_hash32_view0(w, n, m, tile, 1);
-   peach_sha256_compress(st, w);
+   PEACH_SHA256_VIEW_COMPRESS(st, w);
    PEACH_HASH32_NOUNROLL
    for (k = 1; k < 16; k++) {
       carry = peach_hash32_viewk(w, carry, tile, k, 1);
-      peach_sha256_compress(st, w);
+      PEACH_SHA256_VIEW_COMPRESS(st, w);
    }
    peach_hash32_view16(w, carry, tile, 1);
-   peach_sha256_compress(st, w);
+   PEACH_SHA256_VIEW_COMPRESS(st, w);
    out[0] = peach_bswap32(st[0]);
    out[1] = peach_bswap32(st[1]);
    out[2] = peach_bswap32(st[2]);
@@ -752,6 +838,9 @@ PEACH_DEV void peach_sha256_final(const word32 hash0[8], const uint4 *tile,
    word32 st[8], w[16];
    uint4 v0, v1;
    int k;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+   word32 sha_one = c_peach_sha256_one;
+#endif
 
    peach_sha256_iv(st);
    v0 = PEACH_LDGTILE(&tile[0]);
@@ -768,11 +857,11 @@ PEACH_DEV void peach_sha256_final(const word32 hash0[8], const uint4 *tile,
    w[10] = peach_bswap32(v0.z); w[11] = peach_bswap32(v0.w);
    w[12] = peach_bswap32(v1.x); w[13] = peach_bswap32(v1.y);
    w[14] = peach_bswap32(v1.z); w[15] = peach_bswap32(v1.w);
-   peach_sha256_compress(st, w);
+   PEACH_SHA256_VIEW_COMPRESS(st, w);
    PEACH_HASH32_NOUNROLL
    for (k = 1; k < 16; k++) {
       peach_hash32_load64(w, &tile[(4 * k) - 2]);
-      peach_sha256_compress(st, w);
+      PEACH_SHA256_VIEW_COMPRESS(st, w);
    }
    v0 = PEACH_LDGTILE(&tile[62]);
    v1 = PEACH_LDGTILE(&tile[63]);
@@ -783,7 +872,7 @@ PEACH_DEV void peach_sha256_final(const word32 hash0[8], const uint4 *tile,
    w[8] = WORD32_C(0x80000000);
    w[9] = 0; w[10] = 0; w[11] = 0; w[12] = 0; w[13] = 0; w[14] = 0;
    w[15] = PEACH_HASH32_FINALBITS;
-   peach_sha256_compress(st, w);
+   PEACH_SHA256_VIEW_COMPRESS(st, w);
    out[0] = peach_bswap32(st[0]);
    out[1] = peach_bswap32(st[1]);
    out[2] = peach_bswap32(st[2]);
@@ -793,6 +882,8 @@ PEACH_DEV void peach_sha256_final(const word32 hash0[8], const uint4 *tile,
    out[6] = peach_bswap32(st[6]);
    out[7] = peach_bswap32(st[7]);
 }  /* end peach_sha256_final() */
+
+#undef PEACH_SHA256_VIEW_COMPRESS
 
 /* end include guard */
 #endif
