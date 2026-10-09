@@ -19,8 +19,9 @@
  * Blake2b uses literal-sigma rounds over named words and one rolled
  * compression body for all 9 blocks (key block fast-forwarded). Keccak-f
  * is the 4-round unrolled loop of crypto-c sha3_keccakf_unrolled() (after
- * Marko Kreen's spongeshaker transform), one rolled permutation body for
- * all 8 blocks.
+ * Marko Kreen's spongeshaker transform) over the 32-bit halves of the
+ * lanes, with theta applied as one three-input XOR per half, one rolled
+ * permutation body for all 8 blocks.
  * @copyright Adequate Systems LLC, 2018-2025. All Rights Reserved.
  * <br />For license information, please refer to ../LICENSE.md
  * <br /><br />
@@ -315,270 +316,393 @@ PEACH_DEV void peach_sh_blake2b(const word32 *n, word32 index,
    out[6] = (word32) h3; out[7] = (word32) (h3 >> 32);
 }  /* end peach_sh_blake2b() */
 
+/* fully unrolled loop on device (constant trip count, register array) */
+#ifdef __CUDACC__
+   #define PEACH_H64_UNROLL   _Pragma("unroll")
+#else
+   #define PEACH_H64_UNROLL
+#endif
+
+/* Keccak-f in 32-bit halves: lane i of a state is s[2i] (low word) and
+ * s[2i + 1] (high word), as the little-endian 64-bit lane */
+
 /**
  * @private
- * Keccak-f[1600] permutation of a state held in registers, 4 rounds per
- * loop iteration (lane positions repeat every 4 rounds), as crypto-c
- * sha3_keccakf_unrolled(). Only call with a local array (constant
- * indices only) that the forced inlining keeps in registers.
- * @param st Pointer to the state, 25 lanes
+ * Three-input XOR, a single LOP3 on the device. Written as inline PTX so
+ * that the compiler keeps the grouping (a ^ b ^ c) instead of building a
+ * shared (b ^ c) term with several uses.
 */
-PEACH_DEV void peach_keccakf(word64 *st)
+PEACH_DEV word32 peach_xor3(word32 a, word32 b, word32 c)
 {
-   word64 Ba, Be, Bi, Bo, Bu, Ca, Ce, Ci, Co, Cu, Da, De, Di, Do, Du;
+#ifdef __CUDA_ARCH__
+   word32 d;
+
+   asm("lop3.b32 %0, %1, %2, %3, 0x96;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+   return d;
+#else
+   return a ^ b ^ c;
+#endif
+}  /* end peach_xor3() */
+
+/* (dl, dh) = (sl, sh) rotated left by the constant n, 0..63, as funnel
+ * shifts of the halves (n >= 32 swaps the halves) */
+#define PEACH_K_ROT(dl, dh, sl, sh, n) \
+   do { \
+      if ((n) == 0) { (dl) = (sl); (dh) = (sh); } \
+      else if ((n) < 32) { \
+         (dl) = __funnelshift_l((sh), (sl), (unsigned int) ((n) & 31)); \
+         (dh) = __funnelshift_l((sl), (sh), (unsigned int) ((n) & 31)); \
+      } else { \
+         (dl) = __funnelshift_l((sl), (sh), (unsigned int) ((n) & 31)); \
+         (dh) = __funnelshift_l((sh), (sl), (unsigned int) ((n) & 31)); \
+      } \
+   } while (0)
+
+/* (dl, dh) = (sl, sh) rotated left by 1 */
+#define PEACH_K_ROT1(dl, dh, sl, sh) \
+   do { \
+      (dl) = __funnelshift_l((sh), (sl), 1u); \
+      (dh) = __funnelshift_l((sl), (sh), 1u); \
+   } while (0)
+
+/* theta and rho of one lane: (bl, bh) = (lane ^ C[x - 1] ^ rotl(C[x + 1],
+ * 1)) rotated left by n; the theta term D[x] is never formed, each half
+ * is one three-input XOR */
+#define PEACH_K_THETA(bl, bh, al, ah, cl, ch, rl, rh, n) \
+   do { \
+      word32 tl_ = peach_xor3((al), (cl), (rl)); \
+      word32 th_ = peach_xor3((ah), (ch), (rh)); \
+      PEACH_K_ROT(bl, bh, tl_, th_, n); \
+   } while (0)
+
+/* chi of one lane: a ^ (~b & c), one LOP3 per half */
+#define PEACH_K_CHI(ol, oh, al, ah, bl, bh, cl, ch) \
+   do { \
+      (ol) = (al) ^ ((~(bl)) & (cl)); \
+      (oh) = (ah) ^ ((~(bh)) & (ch)); \
+   } while (0)
+
+/* chi of lane 0 and iota with round constant R */
+#define PEACH_K_CHIRC(ol, oh, al, ah, bl, bh, cl, ch, R) \
+   do { \
+      word64 rc_ = c_peach_keccakf_rndc[R]; \
+      (ol) = (al) ^ ((~(bl)) & (cl)) ^ (word32) rc_; \
+      (oh) = (ah) ^ ((~(bh)) & (ch)) ^ (word32) (rc_ >> 32); \
+   } while (0)
+
+/**
+ * @private
+ * Keccak-f[1600] permutation of a state held in registers as 50 32-bit
+ * halves, 4 rounds per loop iteration (lane positions repeat every 4
+ * rounds), as crypto-c sha3_keccakf_unrolled() (after Marko Kreen's
+ * spongeshaker transform). Theta is applied without forming D[x]: every
+ * lane half gets lane ^ C[x - 1] ^ rotl(C[x + 1], 1) in one LOP3. Only
+ * call with a local array (constant indices only) that the forced
+ * inlining keeps in registers.
+ * @param s Pointer to the state, 50 words (lane i = s[2i], s[2i + 1])
+*/
+PEACH_DEV void peach_keccakf(word32 *s)
+{
+   word32 c0l, c0h, c1l, c1h, c2l, c2h, c3l, c3h, c4l, c4h;
+   word32 r0l, r0h, r1l, r1h, r2l, r2h, r3l, r3h, r4l, r4h;
+   word32 Bal, Bah, Bel, Beh, Bil, Bih, Bol, Boh, Bul, Buh;
    int r;
 
    PEACH_H64_ROLLED
    for (r = 0; r < 24; r += 4) {
       /* round r + 0 */
-      Ca = st[0] ^ st[5] ^ st[10] ^ st[15] ^ st[20];
-      Ce = st[1] ^ st[6] ^ st[11] ^ st[16] ^ st[21];
-      Ci = st[2] ^ st[7] ^ st[12] ^ st[17] ^ st[22];
-      Co = st[3] ^ st[8] ^ st[13] ^ st[18] ^ st[23];
-      Cu = st[4] ^ st[9] ^ st[14] ^ st[19] ^ st[24];
-      Da = Cu ^ peach_rotl64(Ce, 1);
-      De = Ca ^ peach_rotl64(Ci, 1);
-      Di = Ce ^ peach_rotl64(Co, 1);
-      Do = Ci ^ peach_rotl64(Cu, 1);
-      Du = Co ^ peach_rotl64(Ca, 1);
-      Ba = (st[0] ^ Da);
-      Be = peach_rotl64((st[6] ^ De), 44);
-      Bi = peach_rotl64((st[12] ^ Di), 43);
-      Bo = peach_rotl64((st[18] ^ Do), 21);
-      Bu = peach_rotl64((st[24] ^ Du), 14);
-      st[0] = Ba ^ ((~Be) & Bi) ^ c_peach_keccakf_rndc[r];
-      st[6]  = Be ^ ((~Bi) & Bo);
-      st[12] = Bi ^ ((~Bo) & Bu);
-      st[18] = Bo ^ ((~Bu) & Ba);
-      st[24] = Bu ^ ((~Ba) & Be);
-      Bi = peach_rotl64((st[10] ^ Da), 3);
-      Bo = peach_rotl64((st[16] ^ De), 45);
-      Bu = peach_rotl64((st[22] ^ Di), 61);
-      Ba = peach_rotl64((st[3] ^ Do), 28);
-      Be = peach_rotl64((st[9] ^ Du), 20);
-      st[10] = Ba ^ ((~Be) & Bi);
-      st[16] = Be ^ ((~Bi) & Bo);
-      st[22] = Bi ^ ((~Bo) & Bu);
-      st[3] = Bo ^ ((~Bu) & Ba);
-      st[9] = Bu ^ ((~Ba) & Be);
-      Bu = peach_rotl64((st[20] ^ Da), 18);
-      Ba = peach_rotl64((st[1] ^ De), 1);
-      Be = peach_rotl64((st[7] ^ Di), 6);
-      Bi = peach_rotl64((st[13] ^ Do), 25);
-      Bo = peach_rotl64((st[19] ^ Du), 8);
-      st[20] = Ba ^ ((~Be) & Bi);
-      st[1] = Be ^ ((~Bi) & Bo);
-      st[7] = Bi ^ ((~Bo) & Bu);
-      st[13] = Bo ^ ((~Bu) & Ba);
-      st[19] = Bu ^ ((~Ba) & Be);
-      Be = peach_rotl64((st[5] ^ Da), 36);
-      Bi = peach_rotl64((st[11] ^ De), 10);
-      Bo = peach_rotl64((st[17] ^ Di), 15);
-      Bu = peach_rotl64((st[23] ^ Do), 56);
-      Ba = peach_rotl64((st[4] ^ Du), 27);
-      st[5] = Ba ^ ((~Be) & Bi);
-      st[11] = Be ^ ((~Bi) & Bo);
-      st[17] = Bi ^ ((~Bo) & Bu);
-      st[23] = Bo ^ ((~Bu) & Ba);
-      st[4] = Bu ^ ((~Ba) & Be);
-      Bo = peach_rotl64((st[15] ^ Da), 41);
-      Bu = peach_rotl64((st[21] ^ De), 2);
-      Ba = peach_rotl64((st[2] ^ Di), 62);
-      Be = peach_rotl64((st[8] ^ Do), 55);
-      Bi = peach_rotl64((st[14] ^ Du), 39);
-      st[15] = Ba ^ ((~Be) & Bi);
-      st[21] = Be ^ ((~Bi) & Bo);
-      st[2] = Bi ^ ((~Bo) & Bu);
-      st[8] = Bo ^ ((~Bu) & Ba);
-      st[14] = Bu ^ ((~Ba) & Be);
+      c0l = s[0] ^ s[10] ^ s[20] ^ s[30] ^ s[40];
+      c0h = s[1] ^ s[11] ^ s[21] ^ s[31] ^ s[41];
+      c1l = s[2] ^ s[12] ^ s[22] ^ s[32] ^ s[42];
+      c1h = s[3] ^ s[13] ^ s[23] ^ s[33] ^ s[43];
+      c2l = s[4] ^ s[14] ^ s[24] ^ s[34] ^ s[44];
+      c2h = s[5] ^ s[15] ^ s[25] ^ s[35] ^ s[45];
+      c3l = s[6] ^ s[16] ^ s[26] ^ s[36] ^ s[46];
+      c3h = s[7] ^ s[17] ^ s[27] ^ s[37] ^ s[47];
+      c4l = s[8] ^ s[18] ^ s[28] ^ s[38] ^ s[48];
+      c4h = s[9] ^ s[19] ^ s[29] ^ s[39] ^ s[49];
+      PEACH_K_ROT1(r0l, r0h, c0l, c0h);
+      PEACH_K_ROT1(r1l, r1h, c1l, c1h);
+      PEACH_K_ROT1(r2l, r2h, c2l, c2h);
+      PEACH_K_ROT1(r3l, r3h, c3l, c3h);
+      PEACH_K_ROT1(r4l, r4h, c4l, c4h);
+      PEACH_K_THETA(Bal, Bah, s[0], s[1], c4l, c4h, r1l, r1h, 0);
+      PEACH_K_THETA(Bel, Beh, s[12], s[13], c0l, c0h, r2l, r2h, 44);
+      PEACH_K_THETA(Bil, Bih, s[24], s[25], c1l, c1h, r3l, r3h, 43);
+      PEACH_K_THETA(Bol, Boh, s[36], s[37], c2l, c2h, r4l, r4h, 21);
+      PEACH_K_THETA(Bul, Buh, s[48], s[49], c3l, c3h, r0l, r0h, 14);
+      PEACH_K_CHIRC(s[0], s[1], Bal, Bah, Bel, Beh, Bil, Bih, r);
+      PEACH_K_CHI(s[12], s[13], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[24], s[25], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[36], s[37], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[48], s[49], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bil, Bih, s[20], s[21], c4l, c4h, r1l, r1h, 3);
+      PEACH_K_THETA(Bol, Boh, s[32], s[33], c0l, c0h, r2l, r2h, 45);
+      PEACH_K_THETA(Bul, Buh, s[44], s[45], c1l, c1h, r3l, r3h, 61);
+      PEACH_K_THETA(Bal, Bah, s[6], s[7], c2l, c2h, r4l, r4h, 28);
+      PEACH_K_THETA(Bel, Beh, s[18], s[19], c3l, c3h, r0l, r0h, 20);
+      PEACH_K_CHI(s[20], s[21], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[32], s[33], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[44], s[45], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[6], s[7], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[18], s[19], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bul, Buh, s[40], s[41], c4l, c4h, r1l, r1h, 18);
+      PEACH_K_THETA(Bal, Bah, s[2], s[3], c0l, c0h, r2l, r2h, 1);
+      PEACH_K_THETA(Bel, Beh, s[14], s[15], c1l, c1h, r3l, r3h, 6);
+      PEACH_K_THETA(Bil, Bih, s[26], s[27], c2l, c2h, r4l, r4h, 25);
+      PEACH_K_THETA(Bol, Boh, s[38], s[39], c3l, c3h, r0l, r0h, 8);
+      PEACH_K_CHI(s[40], s[41], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[2], s[3], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[14], s[15], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[26], s[27], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[38], s[39], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bel, Beh, s[10], s[11], c4l, c4h, r1l, r1h, 36);
+      PEACH_K_THETA(Bil, Bih, s[22], s[23], c0l, c0h, r2l, r2h, 10);
+      PEACH_K_THETA(Bol, Boh, s[34], s[35], c1l, c1h, r3l, r3h, 15);
+      PEACH_K_THETA(Bul, Buh, s[46], s[47], c2l, c2h, r4l, r4h, 56);
+      PEACH_K_THETA(Bal, Bah, s[8], s[9], c3l, c3h, r0l, r0h, 27);
+      PEACH_K_CHI(s[10], s[11], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[22], s[23], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[34], s[35], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[46], s[47], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[8], s[9], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bol, Boh, s[30], s[31], c4l, c4h, r1l, r1h, 41);
+      PEACH_K_THETA(Bul, Buh, s[42], s[43], c0l, c0h, r2l, r2h, 2);
+      PEACH_K_THETA(Bal, Bah, s[4], s[5], c1l, c1h, r3l, r3h, 62);
+      PEACH_K_THETA(Bel, Beh, s[16], s[17], c2l, c2h, r4l, r4h, 55);
+      PEACH_K_THETA(Bil, Bih, s[28], s[29], c3l, c3h, r0l, r0h, 39);
+      PEACH_K_CHI(s[30], s[31], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[42], s[43], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[4], s[5], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[16], s[17], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[28], s[29], Bul, Buh, Bal, Bah, Bel, Beh);
 
       /* round r + 1 */
-      Ca = st[0] ^ st[10] ^ st[20] ^ st[5] ^ st[15];
-      Ce = st[6] ^ st[16] ^ st[1] ^ st[11] ^ st[21];
-      Ci = st[12] ^ st[22] ^ st[7] ^ st[17] ^ st[2];
-      Co = st[18] ^ st[3] ^ st[13] ^ st[23] ^ st[8];
-      Cu = st[24] ^ st[9] ^ st[19] ^ st[4] ^ st[14];
-      Da = Cu ^ peach_rotl64(Ce, 1);
-      De = Ca ^ peach_rotl64(Ci, 1);
-      Di = Ce ^ peach_rotl64(Co, 1);
-      Do = Ci ^ peach_rotl64(Cu, 1);
-      Du = Co ^ peach_rotl64(Ca, 1);
-      Ba = (st[0] ^ Da);
-      Be = peach_rotl64((st[16] ^ De), 44);
-      Bi = peach_rotl64((st[7] ^ Di), 43);
-      Bo = peach_rotl64((st[23] ^ Do), 21);
-      Bu = peach_rotl64((st[14] ^ Du), 14);
-      st[0] = Ba ^ ((~Be) & Bi) ^ c_peach_keccakf_rndc[r + 1];
-      st[16] = Be ^ ((~Bi) & Bo);
-      st[7] = Bi ^ ((~Bo) & Bu);
-      st[23] = Bo ^ ((~Bu) & Ba);
-      st[14] = Bu ^ ((~Ba) & Be);
-      Bi = peach_rotl64((st[20] ^ Da), 3);
-      Bo = peach_rotl64((st[11] ^ De), 45);
-      Bu = peach_rotl64((st[2] ^ Di), 61);
-      Ba = peach_rotl64((st[18] ^ Do), 28);
-      Be = peach_rotl64((st[9] ^ Du), 20);
-      st[20] = Ba ^ ((~Be) & Bi);
-      st[11] = Be ^ ((~Bi) & Bo);
-      st[2] = Bi ^ ((~Bo) & Bu);
-      st[18] = Bo ^ ((~Bu) & Ba);
-      st[9] = Bu ^ ((~Ba) & Be);
-      Bu = peach_rotl64((st[15] ^ Da), 18);
-      Ba = peach_rotl64((st[6] ^ De), 1);
-      Be = peach_rotl64((st[22] ^ Di), 6);
-      Bi = peach_rotl64((st[13] ^ Do), 25);
-      Bo = peach_rotl64((st[4] ^ Du), 8);
-      st[15] = Ba ^ ((~Be) & Bi);
-      st[6] = Be ^ ((~Bi) & Bo);
-      st[22] = Bi ^ ((~Bo) & Bu);
-      st[13] = Bo ^ ((~Bu) & Ba);
-      st[4] = Bu ^ ((~Ba) & Be);
-      Be = peach_rotl64((st[10] ^ Da), 36);
-      Bi = peach_rotl64((st[1] ^ De), 10);
-      Bo = peach_rotl64((st[17] ^ Di), 15);
-      Bu = peach_rotl64((st[8] ^ Do), 56);
-      Ba = peach_rotl64((st[24] ^ Du), 27);
-      st[10] = Ba ^ ((~Be) & Bi);
-      st[1] = Be ^ ((~Bi) & Bo);
-      st[17] = Bi ^ ((~Bo) & Bu);
-      st[8] = Bo ^ ((~Bu) & Ba);
-      st[24] = Bu ^ ((~Ba) & Be);
-      Bo = peach_rotl64((st[5] ^ Da), 41);
-      Bu = peach_rotl64((st[21] ^ De), 2);
-      Ba = peach_rotl64((st[12] ^ Di), 62);
-      Be = peach_rotl64((st[3] ^ Do), 55);
-      Bi = peach_rotl64((st[19] ^ Du), 39);
-      st[5] = Ba ^ ((~Be) & Bi);
-      st[21] = Be ^ ((~Bi) & Bo);
-      st[12] = Bi ^ ((~Bo) & Bu);
-      st[3] = Bo ^ ((~Bu) & Ba);
-      st[19] = Bu ^ ((~Ba) & Be);
+      c0l = s[0] ^ s[10] ^ s[20] ^ s[30] ^ s[40];
+      c0h = s[1] ^ s[11] ^ s[21] ^ s[31] ^ s[41];
+      c1l = s[2] ^ s[12] ^ s[22] ^ s[32] ^ s[42];
+      c1h = s[3] ^ s[13] ^ s[23] ^ s[33] ^ s[43];
+      c2l = s[4] ^ s[14] ^ s[24] ^ s[34] ^ s[44];
+      c2h = s[5] ^ s[15] ^ s[25] ^ s[35] ^ s[45];
+      c3l = s[6] ^ s[16] ^ s[26] ^ s[36] ^ s[46];
+      c3h = s[7] ^ s[17] ^ s[27] ^ s[37] ^ s[47];
+      c4l = s[8] ^ s[18] ^ s[28] ^ s[38] ^ s[48];
+      c4h = s[9] ^ s[19] ^ s[29] ^ s[39] ^ s[49];
+      PEACH_K_ROT1(r0l, r0h, c0l, c0h);
+      PEACH_K_ROT1(r1l, r1h, c1l, c1h);
+      PEACH_K_ROT1(r2l, r2h, c2l, c2h);
+      PEACH_K_ROT1(r3l, r3h, c3l, c3h);
+      PEACH_K_ROT1(r4l, r4h, c4l, c4h);
+      PEACH_K_THETA(Bal, Bah, s[0], s[1], c4l, c4h, r1l, r1h, 0);
+      PEACH_K_THETA(Bel, Beh, s[32], s[33], c0l, c0h, r2l, r2h, 44);
+      PEACH_K_THETA(Bil, Bih, s[14], s[15], c1l, c1h, r3l, r3h, 43);
+      PEACH_K_THETA(Bol, Boh, s[46], s[47], c2l, c2h, r4l, r4h, 21);
+      PEACH_K_THETA(Bul, Buh, s[28], s[29], c3l, c3h, r0l, r0h, 14);
+      PEACH_K_CHIRC(s[0], s[1], Bal, Bah, Bel, Beh, Bil, Bih, r + 1);
+      PEACH_K_CHI(s[32], s[33], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[14], s[15], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[46], s[47], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[28], s[29], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bil, Bih, s[40], s[41], c4l, c4h, r1l, r1h, 3);
+      PEACH_K_THETA(Bol, Boh, s[22], s[23], c0l, c0h, r2l, r2h, 45);
+      PEACH_K_THETA(Bul, Buh, s[4], s[5], c1l, c1h, r3l, r3h, 61);
+      PEACH_K_THETA(Bal, Bah, s[36], s[37], c2l, c2h, r4l, r4h, 28);
+      PEACH_K_THETA(Bel, Beh, s[18], s[19], c3l, c3h, r0l, r0h, 20);
+      PEACH_K_CHI(s[40], s[41], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[22], s[23], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[4], s[5], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[36], s[37], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[18], s[19], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bul, Buh, s[30], s[31], c4l, c4h, r1l, r1h, 18);
+      PEACH_K_THETA(Bal, Bah, s[12], s[13], c0l, c0h, r2l, r2h, 1);
+      PEACH_K_THETA(Bel, Beh, s[44], s[45], c1l, c1h, r3l, r3h, 6);
+      PEACH_K_THETA(Bil, Bih, s[26], s[27], c2l, c2h, r4l, r4h, 25);
+      PEACH_K_THETA(Bol, Boh, s[8], s[9], c3l, c3h, r0l, r0h, 8);
+      PEACH_K_CHI(s[30], s[31], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[12], s[13], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[44], s[45], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[26], s[27], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[8], s[9], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bel, Beh, s[20], s[21], c4l, c4h, r1l, r1h, 36);
+      PEACH_K_THETA(Bil, Bih, s[2], s[3], c0l, c0h, r2l, r2h, 10);
+      PEACH_K_THETA(Bol, Boh, s[34], s[35], c1l, c1h, r3l, r3h, 15);
+      PEACH_K_THETA(Bul, Buh, s[16], s[17], c2l, c2h, r4l, r4h, 56);
+      PEACH_K_THETA(Bal, Bah, s[48], s[49], c3l, c3h, r0l, r0h, 27);
+      PEACH_K_CHI(s[20], s[21], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[2], s[3], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[34], s[35], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[16], s[17], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[48], s[49], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bol, Boh, s[10], s[11], c4l, c4h, r1l, r1h, 41);
+      PEACH_K_THETA(Bul, Buh, s[42], s[43], c0l, c0h, r2l, r2h, 2);
+      PEACH_K_THETA(Bal, Bah, s[24], s[25], c1l, c1h, r3l, r3h, 62);
+      PEACH_K_THETA(Bel, Beh, s[6], s[7], c2l, c2h, r4l, r4h, 55);
+      PEACH_K_THETA(Bil, Bih, s[38], s[39], c3l, c3h, r0l, r0h, 39);
+      PEACH_K_CHI(s[10], s[11], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[42], s[43], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[24], s[25], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[6], s[7], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[38], s[39], Bul, Buh, Bal, Bah, Bel, Beh);
 
       /* round r + 2 */
-      Ca = st[0] ^ st[20] ^ st[15] ^ st[10] ^ st[5];
-      Ce = st[16] ^ st[11] ^ st[6] ^ st[1] ^ st[21];
-      Ci = st[7] ^ st[2] ^ st[22] ^ st[17] ^ st[12];
-      Co = st[23] ^ st[18] ^ st[13] ^ st[8] ^ st[3];
-      Cu = st[14] ^ st[9] ^ st[4] ^ st[24] ^ st[19];
-      Da = Cu ^ peach_rotl64(Ce, 1);
-      De = Ca ^ peach_rotl64(Ci, 1);
-      Di = Ce ^ peach_rotl64(Co, 1);
-      Do = Ci ^ peach_rotl64(Cu, 1);
-      Du = Co ^ peach_rotl64(Ca, 1);
-      Ba = (st[0] ^ Da);
-      Be = peach_rotl64((st[11] ^ De), 44);
-      Bi = peach_rotl64((st[22] ^ Di), 43);
-      Bo = peach_rotl64((st[8] ^ Do), 21);
-      Bu = peach_rotl64((st[19] ^ Du), 14);
-      st[0] = Ba ^ ((~Be) & Bi) ^ c_peach_keccakf_rndc[r + 2];
-      st[11] = Be ^ ((~Bi) & Bo);
-      st[22] = Bi ^ ((~Bo) & Bu);
-      st[8] = Bo ^ ((~Bu) & Ba);
-      st[19] = Bu ^ ((~Ba) & Be);
-      Bi = peach_rotl64((st[15] ^ Da), 3);
-      Bo = peach_rotl64((st[1] ^ De), 45);
-      Bu = peach_rotl64((st[12] ^ Di), 61);
-      Ba = peach_rotl64((st[23] ^ Do), 28);
-      Be = peach_rotl64((st[9] ^ Du), 20);
-      st[15] = Ba ^ ((~Be) & Bi);
-      st[1] = Be ^ ((~Bi) & Bo);
-      st[12] = Bi ^ ((~Bo) & Bu);
-      st[23] = Bo ^ ((~Bu) & Ba);
-      st[9] = Bu ^ ((~Ba) & Be);
-      Bu = peach_rotl64((st[5] ^ Da), 18);
-      Ba = peach_rotl64((st[16] ^ De), 1);
-      Be = peach_rotl64((st[2] ^ Di), 6);
-      Bi = peach_rotl64((st[13] ^ Do), 25);
-      Bo = peach_rotl64((st[24] ^ Du), 8);
-      st[5] = Ba ^ ((~Be) & Bi);
-      st[16] = Be ^ ((~Bi) & Bo);
-      st[2] = Bi ^ ((~Bo) & Bu);
-      st[13] = Bo ^ ((~Bu) & Ba);
-      st[24] = Bu ^ ((~Ba) & Be);
-      Be = peach_rotl64((st[20] ^ Da), 36);
-      Bi = peach_rotl64((st[6] ^ De), 10);
-      Bo = peach_rotl64((st[17] ^ Di), 15);
-      Bu = peach_rotl64((st[3] ^ Do), 56);
-      Ba = peach_rotl64((st[14] ^ Du), 27);
-      st[20] = Ba ^ ((~Be) & Bi);
-      st[6] = Be ^ ((~Bi) & Bo);
-      st[17] = Bi ^ ((~Bo) & Bu);
-      st[3] = Bo ^ ((~Bu) & Ba);
-      st[14] = Bu ^ ((~Ba) & Be);
-      Bo = peach_rotl64((st[10] ^ Da), 41);
-      Bu = peach_rotl64((st[21] ^ De), 2);
-      Ba = peach_rotl64((st[7] ^ Di), 62);
-      Be = peach_rotl64((st[18] ^ Do), 55);
-      Bi = peach_rotl64((st[4] ^ Du), 39);
-      st[10] = Ba ^ ((~Be) & Bi);
-      st[21] = Be ^ ((~Bi) & Bo);
-      st[7] = Bi ^ ((~Bo) & Bu);
-      st[18] = Bo ^ ((~Bu) & Ba);
-      st[4] = Bu ^ ((~Ba) & Be);
+      c0l = s[0] ^ s[10] ^ s[20] ^ s[30] ^ s[40];
+      c0h = s[1] ^ s[11] ^ s[21] ^ s[31] ^ s[41];
+      c1l = s[2] ^ s[12] ^ s[22] ^ s[32] ^ s[42];
+      c1h = s[3] ^ s[13] ^ s[23] ^ s[33] ^ s[43];
+      c2l = s[4] ^ s[14] ^ s[24] ^ s[34] ^ s[44];
+      c2h = s[5] ^ s[15] ^ s[25] ^ s[35] ^ s[45];
+      c3l = s[6] ^ s[16] ^ s[26] ^ s[36] ^ s[46];
+      c3h = s[7] ^ s[17] ^ s[27] ^ s[37] ^ s[47];
+      c4l = s[8] ^ s[18] ^ s[28] ^ s[38] ^ s[48];
+      c4h = s[9] ^ s[19] ^ s[29] ^ s[39] ^ s[49];
+      PEACH_K_ROT1(r0l, r0h, c0l, c0h);
+      PEACH_K_ROT1(r1l, r1h, c1l, c1h);
+      PEACH_K_ROT1(r2l, r2h, c2l, c2h);
+      PEACH_K_ROT1(r3l, r3h, c3l, c3h);
+      PEACH_K_ROT1(r4l, r4h, c4l, c4h);
+      PEACH_K_THETA(Bal, Bah, s[0], s[1], c4l, c4h, r1l, r1h, 0);
+      PEACH_K_THETA(Bel, Beh, s[22], s[23], c0l, c0h, r2l, r2h, 44);
+      PEACH_K_THETA(Bil, Bih, s[44], s[45], c1l, c1h, r3l, r3h, 43);
+      PEACH_K_THETA(Bol, Boh, s[16], s[17], c2l, c2h, r4l, r4h, 21);
+      PEACH_K_THETA(Bul, Buh, s[38], s[39], c3l, c3h, r0l, r0h, 14);
+      PEACH_K_CHIRC(s[0], s[1], Bal, Bah, Bel, Beh, Bil, Bih, r + 2);
+      PEACH_K_CHI(s[22], s[23], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[44], s[45], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[16], s[17], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[38], s[39], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bil, Bih, s[30], s[31], c4l, c4h, r1l, r1h, 3);
+      PEACH_K_THETA(Bol, Boh, s[2], s[3], c0l, c0h, r2l, r2h, 45);
+      PEACH_K_THETA(Bul, Buh, s[24], s[25], c1l, c1h, r3l, r3h, 61);
+      PEACH_K_THETA(Bal, Bah, s[46], s[47], c2l, c2h, r4l, r4h, 28);
+      PEACH_K_THETA(Bel, Beh, s[18], s[19], c3l, c3h, r0l, r0h, 20);
+      PEACH_K_CHI(s[30], s[31], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[2], s[3], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[24], s[25], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[46], s[47], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[18], s[19], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bul, Buh, s[10], s[11], c4l, c4h, r1l, r1h, 18);
+      PEACH_K_THETA(Bal, Bah, s[32], s[33], c0l, c0h, r2l, r2h, 1);
+      PEACH_K_THETA(Bel, Beh, s[4], s[5], c1l, c1h, r3l, r3h, 6);
+      PEACH_K_THETA(Bil, Bih, s[26], s[27], c2l, c2h, r4l, r4h, 25);
+      PEACH_K_THETA(Bol, Boh, s[48], s[49], c3l, c3h, r0l, r0h, 8);
+      PEACH_K_CHI(s[10], s[11], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[32], s[33], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[4], s[5], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[26], s[27], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[48], s[49], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bel, Beh, s[40], s[41], c4l, c4h, r1l, r1h, 36);
+      PEACH_K_THETA(Bil, Bih, s[12], s[13], c0l, c0h, r2l, r2h, 10);
+      PEACH_K_THETA(Bol, Boh, s[34], s[35], c1l, c1h, r3l, r3h, 15);
+      PEACH_K_THETA(Bul, Buh, s[6], s[7], c2l, c2h, r4l, r4h, 56);
+      PEACH_K_THETA(Bal, Bah, s[28], s[29], c3l, c3h, r0l, r0h, 27);
+      PEACH_K_CHI(s[40], s[41], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[12], s[13], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[34], s[35], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[6], s[7], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[28], s[29], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bol, Boh, s[20], s[21], c4l, c4h, r1l, r1h, 41);
+      PEACH_K_THETA(Bul, Buh, s[42], s[43], c0l, c0h, r2l, r2h, 2);
+      PEACH_K_THETA(Bal, Bah, s[14], s[15], c1l, c1h, r3l, r3h, 62);
+      PEACH_K_THETA(Bel, Beh, s[36], s[37], c2l, c2h, r4l, r4h, 55);
+      PEACH_K_THETA(Bil, Bih, s[8], s[9], c3l, c3h, r0l, r0h, 39);
+      PEACH_K_CHI(s[20], s[21], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[42], s[43], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[14], s[15], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[36], s[37], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[8], s[9], Bul, Buh, Bal, Bah, Bel, Beh);
 
       /* round r + 3 */
-      Ca = st[0] ^ st[15] ^ st[5] ^ st[20] ^ st[10];
-      Ce = st[11] ^ st[1] ^ st[16] ^ st[6] ^ st[21];
-      Ci = st[22] ^ st[12] ^ st[2] ^ st[17] ^ st[7];
-      Co = st[8] ^ st[23] ^ st[13] ^ st[3] ^ st[18];
-      Cu = st[19] ^ st[9] ^ st[24] ^ st[14] ^ st[4];
-      Da = Cu ^ peach_rotl64(Ce, 1);
-      De = Ca ^ peach_rotl64(Ci, 1);
-      Di = Ce ^ peach_rotl64(Co, 1);
-      Do = Ci ^ peach_rotl64(Cu, 1);
-      Du = Co ^ peach_rotl64(Ca, 1);
-      Ba = (st[0] ^ Da);
-      Be = peach_rotl64((st[1] ^ De), 44);
-      Bi = peach_rotl64((st[2] ^ Di), 43);
-      Bo = peach_rotl64((st[3] ^ Do), 21);
-      Bu = peach_rotl64((st[4] ^ Du), 14);
-      st[0] = Ba ^ ((~Be) & Bi) ^ c_peach_keccakf_rndc[r + 3];
-      st[1] = Be ^ ((~Bi) & Bo);
-      st[2] = Bi ^ ((~Bo) & Bu);
-      st[3] = Bo ^ ((~Bu) & Ba);
-      st[4] = Bu ^ ((~Ba) & Be);
-      Bi = peach_rotl64((st[5] ^ Da), 3);
-      Bo = peach_rotl64((st[6] ^ De), 45);
-      Bu = peach_rotl64((st[7] ^ Di), 61);
-      Ba = peach_rotl64((st[8] ^ Do), 28);
-      Be = peach_rotl64((st[9] ^ Du), 20);
-      st[5] = Ba ^ ((~Be) & Bi);
-      st[6] = Be ^ ((~Bi) & Bo);
-      st[7] = Bi ^ ((~Bo) & Bu);
-      st[8] = Bo ^ ((~Bu) & Ba);
-      st[9] = Bu ^ ((~Ba) & Be);
-      Bu = peach_rotl64((st[10] ^ Da), 18);
-      Ba = peach_rotl64((st[11] ^ De), 1);
-      Be = peach_rotl64((st[12] ^ Di), 6);
-      Bi = peach_rotl64((st[13] ^ Do), 25);
-      Bo = peach_rotl64((st[14] ^ Du), 8);
-      st[10] = Ba ^ ((~Be) & Bi);
-      st[11] = Be ^ ((~Bi) & Bo);
-      st[12] = Bi ^ ((~Bo) & Bu);
-      st[13] = Bo ^ ((~Bu) & Ba);
-      st[14] = Bu ^ ((~Ba) & Be);
-      Be = peach_rotl64((st[15] ^ Da), 36);
-      Bi = peach_rotl64((st[16] ^ De), 10);
-      Bo = peach_rotl64((st[17] ^ Di), 15);
-      Bu = peach_rotl64((st[18] ^ Do), 56);
-      Ba = peach_rotl64((st[19] ^ Du), 27);
-      st[15] = Ba ^ ((~Be) & Bi);
-      st[16] = Be ^ ((~Bi) & Bo);
-      st[17] = Bi ^ ((~Bo) & Bu);
-      st[18] = Bo ^ ((~Bu) & Ba);
-      st[19] = Bu ^ ((~Ba) & Be);
-      Bo = peach_rotl64((st[20] ^ Da), 41);
-      Bu = peach_rotl64((st[21] ^ De), 2);
-      Ba = peach_rotl64((st[22] ^ Di), 62);
-      Be = peach_rotl64((st[23] ^ Do), 55);
-      Bi = peach_rotl64((st[24] ^ Du), 39);
-      st[20] = Ba ^ ((~Be) & Bi);
-      st[21] = Be ^ ((~Bi) & Bo);
-      st[22] = Bi ^ ((~Bo) & Bu);
-      st[23] = Bo ^ ((~Bu) & Ba);
-      st[24] = Bu ^ ((~Ba) & Be);
+      c0l = s[0] ^ s[10] ^ s[20] ^ s[30] ^ s[40];
+      c0h = s[1] ^ s[11] ^ s[21] ^ s[31] ^ s[41];
+      c1l = s[2] ^ s[12] ^ s[22] ^ s[32] ^ s[42];
+      c1h = s[3] ^ s[13] ^ s[23] ^ s[33] ^ s[43];
+      c2l = s[4] ^ s[14] ^ s[24] ^ s[34] ^ s[44];
+      c2h = s[5] ^ s[15] ^ s[25] ^ s[35] ^ s[45];
+      c3l = s[6] ^ s[16] ^ s[26] ^ s[36] ^ s[46];
+      c3h = s[7] ^ s[17] ^ s[27] ^ s[37] ^ s[47];
+      c4l = s[8] ^ s[18] ^ s[28] ^ s[38] ^ s[48];
+      c4h = s[9] ^ s[19] ^ s[29] ^ s[39] ^ s[49];
+      PEACH_K_ROT1(r0l, r0h, c0l, c0h);
+      PEACH_K_ROT1(r1l, r1h, c1l, c1h);
+      PEACH_K_ROT1(r2l, r2h, c2l, c2h);
+      PEACH_K_ROT1(r3l, r3h, c3l, c3h);
+      PEACH_K_ROT1(r4l, r4h, c4l, c4h);
+      PEACH_K_THETA(Bal, Bah, s[0], s[1], c4l, c4h, r1l, r1h, 0);
+      PEACH_K_THETA(Bel, Beh, s[2], s[3], c0l, c0h, r2l, r2h, 44);
+      PEACH_K_THETA(Bil, Bih, s[4], s[5], c1l, c1h, r3l, r3h, 43);
+      PEACH_K_THETA(Bol, Boh, s[6], s[7], c2l, c2h, r4l, r4h, 21);
+      PEACH_K_THETA(Bul, Buh, s[8], s[9], c3l, c3h, r0l, r0h, 14);
+      PEACH_K_CHIRC(s[0], s[1], Bal, Bah, Bel, Beh, Bil, Bih, r + 3);
+      PEACH_K_CHI(s[2], s[3], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[4], s[5], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[6], s[7], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[8], s[9], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bil, Bih, s[10], s[11], c4l, c4h, r1l, r1h, 3);
+      PEACH_K_THETA(Bol, Boh, s[12], s[13], c0l, c0h, r2l, r2h, 45);
+      PEACH_K_THETA(Bul, Buh, s[14], s[15], c1l, c1h, r3l, r3h, 61);
+      PEACH_K_THETA(Bal, Bah, s[16], s[17], c2l, c2h, r4l, r4h, 28);
+      PEACH_K_THETA(Bel, Beh, s[18], s[19], c3l, c3h, r0l, r0h, 20);
+      PEACH_K_CHI(s[10], s[11], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[12], s[13], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[14], s[15], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[16], s[17], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[18], s[19], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bul, Buh, s[20], s[21], c4l, c4h, r1l, r1h, 18);
+      PEACH_K_THETA(Bal, Bah, s[22], s[23], c0l, c0h, r2l, r2h, 1);
+      PEACH_K_THETA(Bel, Beh, s[24], s[25], c1l, c1h, r3l, r3h, 6);
+      PEACH_K_THETA(Bil, Bih, s[26], s[27], c2l, c2h, r4l, r4h, 25);
+      PEACH_K_THETA(Bol, Boh, s[28], s[29], c3l, c3h, r0l, r0h, 8);
+      PEACH_K_CHI(s[20], s[21], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[22], s[23], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[24], s[25], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[26], s[27], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[28], s[29], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bel, Beh, s[30], s[31], c4l, c4h, r1l, r1h, 36);
+      PEACH_K_THETA(Bil, Bih, s[32], s[33], c0l, c0h, r2l, r2h, 10);
+      PEACH_K_THETA(Bol, Boh, s[34], s[35], c1l, c1h, r3l, r3h, 15);
+      PEACH_K_THETA(Bul, Buh, s[36], s[37], c2l, c2h, r4l, r4h, 56);
+      PEACH_K_THETA(Bal, Bah, s[38], s[39], c3l, c3h, r0l, r0h, 27);
+      PEACH_K_CHI(s[30], s[31], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[32], s[33], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[34], s[35], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[36], s[37], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[38], s[39], Bul, Buh, Bal, Bah, Bel, Beh);
+      PEACH_K_THETA(Bol, Boh, s[40], s[41], c4l, c4h, r1l, r1h, 41);
+      PEACH_K_THETA(Bul, Buh, s[42], s[43], c0l, c0h, r2l, r2h, 2);
+      PEACH_K_THETA(Bal, Bah, s[44], s[45], c1l, c1h, r3l, r3h, 62);
+      PEACH_K_THETA(Bel, Beh, s[46], s[47], c2l, c2h, r4l, r4h, 55);
+      PEACH_K_THETA(Bil, Bih, s[48], s[49], c3l, c3h, r0l, r0h, 39);
+      PEACH_K_CHI(s[40], s[41], Bal, Bah, Bel, Beh, Bil, Bih);
+      PEACH_K_CHI(s[42], s[43], Bel, Beh, Bil, Bih, Bol, Boh);
+      PEACH_K_CHI(s[44], s[45], Bil, Bih, Bol, Boh, Bul, Buh);
+      PEACH_K_CHI(s[46], s[47], Bol, Boh, Bul, Buh, Bal, Bah);
+      PEACH_K_CHI(s[48], s[49], Bul, Buh, Bal, Bah, Bel, Beh);
    }
 }  /* end peach_keccakf() */
+
+/**
+ * @private
+ * XOR @a x into @a d. On the device as inline PTX, which the compiler
+ * does not merge across the absorb branches of peach_sh_keccak_pad()
+ * (merged XORs need the loaded words moved into common registers
+ * first: about 70 moves per block, and 4 more registers).
+*/
+PEACH_DEV word32 peach_xor_absorb(word32 d, word32 x)
+{
+#ifdef __CUDA_ARCH__
+   asm("xor.b32 %0, %0, %1;" : "+r"(d) : "r"(x));
+   return d;
+#else
+   return d ^ x;
+#endif
+}  /* end peach_xor_absorb() */
+
+/* absorb the lane (lo, hi) into lane i of the state s */
+#define PEACH_K_ABSORB(i, lo, hi) \
+   do { \
+      s[2 * (i)] = peach_xor_absorb(s[2 * (i)], (lo)); \
+      s[2 * (i) + 1] = peach_xor_absorb(s[2 * (i) + 1], (hi)); \
+   } while (0)
 
 /**
  * @private
@@ -600,17 +724,14 @@ PEACH_DEV void peach_keccakf(word64 *st)
 PEACH_DEV void peach_sh_keccak_pad(const word32 *n, word32 index,
    const uint4 *tile, word32 pad, word32 *out)
 {
-   word64 st[25];
+   word32 s[50];
    uint4 q0, q1, q2, q3, q4, q5, q6, q7, q8;
    const uint4 *tp;
    word32 c0, c1, c2;
    int k;
 
-   st[0] = st[1] = st[2] = st[3] = st[4] = 0;
-   st[5] = st[6] = st[7] = st[8] = st[9] = 0;
-   st[10] = st[11] = st[12] = st[13] = st[14] = 0;
-   st[15] = st[16] = st[17] = st[18] = st[19] = 0;
-   st[20] = st[21] = st[22] = st[23] = st[24] = 0;
+   PEACH_H64_UNROLL
+   for (k = 0; k < 50; k++) s[k] = 0;
    c0 = c1 = c2 = 0;
 
    /* 7 full blocks + the final (108-byte) block, one permutation body */
@@ -625,23 +746,23 @@ PEACH_DEV void peach_sh_keccak_pad(const word32 *n, word32 index,
          q4 = PEACH_LDGTILE(&tile[4]);
          q5 = PEACH_LDGTILE(&tile[5]);
          q6 = PEACH_LDGTILE(&tile[6]);
-         st[0] ^= PEACH_H64_LANE(n[0], n[1]);
-         st[1] ^= PEACH_H64_LANE(n[2], n[3]);
-         st[2] ^= PEACH_H64_LANE(n[4], n[5]);
-         st[3] ^= PEACH_H64_LANE(n[6], n[7]);
-         st[4] ^= PEACH_H64_LANE(index, q0.x);
-         st[5] ^= PEACH_H64_LANE(q0.y, q0.z);
-         st[6] ^= PEACH_H64_LANE(q0.w, q1.x);
-         st[7] ^= PEACH_H64_LANE(q1.y, q1.z);
-         st[8] ^= PEACH_H64_LANE(q1.w, q2.x);
-         st[9] ^= PEACH_H64_LANE(q2.y, q2.z);
-         st[10] ^= PEACH_H64_LANE(q2.w, q3.x);
-         st[11] ^= PEACH_H64_LANE(q3.y, q3.z);
-         st[12] ^= PEACH_H64_LANE(q3.w, q4.x);
-         st[13] ^= PEACH_H64_LANE(q4.y, q4.z);
-         st[14] ^= PEACH_H64_LANE(q4.w, q5.x);
-         st[15] ^= PEACH_H64_LANE(q5.y, q5.z);
-         st[16] ^= PEACH_H64_LANE(q5.w, q6.x);
+         PEACH_K_ABSORB(0, n[0], n[1]);
+         PEACH_K_ABSORB(1, n[2], n[3]);
+         PEACH_K_ABSORB(2, n[4], n[5]);
+         PEACH_K_ABSORB(3, n[6], n[7]);
+         PEACH_K_ABSORB(4, index, q0.x);
+         PEACH_K_ABSORB(5, q0.y, q0.z);
+         PEACH_K_ABSORB(6, q0.w, q1.x);
+         PEACH_K_ABSORB(7, q1.y, q1.z);
+         PEACH_K_ABSORB(8, q1.w, q2.x);
+         PEACH_K_ABSORB(9, q2.y, q2.z);
+         PEACH_K_ABSORB(10, q2.w, q3.x);
+         PEACH_K_ABSORB(11, q3.y, q3.z);
+         PEACH_K_ABSORB(12, q3.w, q4.x);
+         PEACH_K_ABSORB(13, q4.y, q4.z);
+         PEACH_K_ABSORB(14, q4.w, q5.x);
+         PEACH_K_ABSORB(15, q5.y, q5.z);
+         PEACH_K_ABSORB(16, q5.w, q6.x);
          c0 = q6.y; c1 = q6.z; c2 = q6.w;
       } else if (k == 7) {
          /* seed words 238..264: tile words 229..255, then padding */
@@ -651,22 +772,22 @@ PEACH_DEV void peach_sh_keccak_pad(const word32 *n, word32 index,
          q3 = PEACH_LDGTILE(&tile[61]);
          q4 = PEACH_LDGTILE(&tile[62]);
          q5 = PEACH_LDGTILE(&tile[63]);
-         st[0] ^= PEACH_H64_LANE(c0, c1);
-         st[1] ^= PEACH_H64_LANE(c2, q0.x);
-         st[2] ^= PEACH_H64_LANE(q0.y, q0.z);
-         st[3] ^= PEACH_H64_LANE(q0.w, q1.x);
-         st[4] ^= PEACH_H64_LANE(q1.y, q1.z);
-         st[5] ^= PEACH_H64_LANE(q1.w, q2.x);
-         st[6] ^= PEACH_H64_LANE(q2.y, q2.z);
-         st[7] ^= PEACH_H64_LANE(q2.w, q3.x);
-         st[8] ^= PEACH_H64_LANE(q3.y, q3.z);
-         st[9] ^= PEACH_H64_LANE(q3.w, q4.x);
-         st[10] ^= PEACH_H64_LANE(q4.y, q4.z);
-         st[11] ^= PEACH_H64_LANE(q4.w, q5.x);
-         st[12] ^= PEACH_H64_LANE(q5.y, q5.z);
+         PEACH_K_ABSORB(0, c0, c1);
+         PEACH_K_ABSORB(1, c2, q0.x);
+         PEACH_K_ABSORB(2, q0.y, q0.z);
+         PEACH_K_ABSORB(3, q0.w, q1.x);
+         PEACH_K_ABSORB(4, q1.y, q1.z);
+         PEACH_K_ABSORB(5, q1.w, q2.x);
+         PEACH_K_ABSORB(6, q2.y, q2.z);
+         PEACH_K_ABSORB(7, q2.w, q3.x);
+         PEACH_K_ABSORB(8, q3.y, q3.z);
+         PEACH_K_ABSORB(9, q3.w, q4.x);
+         PEACH_K_ABSORB(10, q4.y, q4.z);
+         PEACH_K_ABSORB(11, q4.w, q5.x);
+         PEACH_K_ABSORB(12, q5.y, q5.z);
          /* pad byte at block byte 108, 0x80 at block byte 135 */
-         st[13] ^= PEACH_H64_LANE(q5.w, pad);
-         st[16] ^= WORD64_C(0x8000000000000000);
+         PEACH_K_ABSORB(13, q5.w, pad);
+         s[33] ^= WORD32_C(0x80000000);
       } else if (k & 1) {
          /* seed words 34k..34k+33: tile words 34k-9..34k+24 */
          tp = &tile[(17 * (k >> 1)) + 7];
@@ -678,23 +799,23 @@ PEACH_DEV void peach_sh_keccak_pad(const word32 *n, word32 index,
          q5 = PEACH_LDGTILE(&tp[5]);
          q6 = PEACH_LDGTILE(&tp[6]);
          q7 = PEACH_LDGTILE(&tp[7]);
-         st[0] ^= PEACH_H64_LANE(c0, c1);
-         st[1] ^= PEACH_H64_LANE(c2, q0.x);
-         st[2] ^= PEACH_H64_LANE(q0.y, q0.z);
-         st[3] ^= PEACH_H64_LANE(q0.w, q1.x);
-         st[4] ^= PEACH_H64_LANE(q1.y, q1.z);
-         st[5] ^= PEACH_H64_LANE(q1.w, q2.x);
-         st[6] ^= PEACH_H64_LANE(q2.y, q2.z);
-         st[7] ^= PEACH_H64_LANE(q2.w, q3.x);
-         st[8] ^= PEACH_H64_LANE(q3.y, q3.z);
-         st[9] ^= PEACH_H64_LANE(q3.w, q4.x);
-         st[10] ^= PEACH_H64_LANE(q4.y, q4.z);
-         st[11] ^= PEACH_H64_LANE(q4.w, q5.x);
-         st[12] ^= PEACH_H64_LANE(q5.y, q5.z);
-         st[13] ^= PEACH_H64_LANE(q5.w, q6.x);
-         st[14] ^= PEACH_H64_LANE(q6.y, q6.z);
-         st[15] ^= PEACH_H64_LANE(q6.w, q7.x);
-         st[16] ^= PEACH_H64_LANE(q7.y, q7.z);
+         PEACH_K_ABSORB(0, c0, c1);
+         PEACH_K_ABSORB(1, c2, q0.x);
+         PEACH_K_ABSORB(2, q0.y, q0.z);
+         PEACH_K_ABSORB(3, q0.w, q1.x);
+         PEACH_K_ABSORB(4, q1.y, q1.z);
+         PEACH_K_ABSORB(5, q1.w, q2.x);
+         PEACH_K_ABSORB(6, q2.y, q2.z);
+         PEACH_K_ABSORB(7, q2.w, q3.x);
+         PEACH_K_ABSORB(8, q3.y, q3.z);
+         PEACH_K_ABSORB(9, q3.w, q4.x);
+         PEACH_K_ABSORB(10, q4.y, q4.z);
+         PEACH_K_ABSORB(11, q4.w, q5.x);
+         PEACH_K_ABSORB(12, q5.y, q5.z);
+         PEACH_K_ABSORB(13, q5.w, q6.x);
+         PEACH_K_ABSORB(14, q6.y, q6.z);
+         PEACH_K_ABSORB(15, q6.w, q7.x);
+         PEACH_K_ABSORB(16, q7.y, q7.z);
          c0 = q7.w;
       } else {
          /* seed words 34k..34k+33: tile words 34k-9..34k+24 */
@@ -708,33 +829,31 @@ PEACH_DEV void peach_sh_keccak_pad(const word32 *n, word32 index,
          q6 = PEACH_LDGTILE(&tp[6]);
          q7 = PEACH_LDGTILE(&tp[7]);
          q8 = PEACH_LDGTILE(&tp[8]);
-         st[0] ^= PEACH_H64_LANE(c0, q0.x);
-         st[1] ^= PEACH_H64_LANE(q0.y, q0.z);
-         st[2] ^= PEACH_H64_LANE(q0.w, q1.x);
-         st[3] ^= PEACH_H64_LANE(q1.y, q1.z);
-         st[4] ^= PEACH_H64_LANE(q1.w, q2.x);
-         st[5] ^= PEACH_H64_LANE(q2.y, q2.z);
-         st[6] ^= PEACH_H64_LANE(q2.w, q3.x);
-         st[7] ^= PEACH_H64_LANE(q3.y, q3.z);
-         st[8] ^= PEACH_H64_LANE(q3.w, q4.x);
-         st[9] ^= PEACH_H64_LANE(q4.y, q4.z);
-         st[10] ^= PEACH_H64_LANE(q4.w, q5.x);
-         st[11] ^= PEACH_H64_LANE(q5.y, q5.z);
-         st[12] ^= PEACH_H64_LANE(q5.w, q6.x);
-         st[13] ^= PEACH_H64_LANE(q6.y, q6.z);
-         st[14] ^= PEACH_H64_LANE(q6.w, q7.x);
-         st[15] ^= PEACH_H64_LANE(q7.y, q7.z);
-         st[16] ^= PEACH_H64_LANE(q7.w, q8.x);
+         PEACH_K_ABSORB(0, c0, q0.x);
+         PEACH_K_ABSORB(1, q0.y, q0.z);
+         PEACH_K_ABSORB(2, q0.w, q1.x);
+         PEACH_K_ABSORB(3, q1.y, q1.z);
+         PEACH_K_ABSORB(4, q1.w, q2.x);
+         PEACH_K_ABSORB(5, q2.y, q2.z);
+         PEACH_K_ABSORB(6, q2.w, q3.x);
+         PEACH_K_ABSORB(7, q3.y, q3.z);
+         PEACH_K_ABSORB(8, q3.w, q4.x);
+         PEACH_K_ABSORB(9, q4.y, q4.z);
+         PEACH_K_ABSORB(10, q4.w, q5.x);
+         PEACH_K_ABSORB(11, q5.y, q5.z);
+         PEACH_K_ABSORB(12, q5.w, q6.x);
+         PEACH_K_ABSORB(13, q6.y, q6.z);
+         PEACH_K_ABSORB(14, q6.w, q7.x);
+         PEACH_K_ABSORB(15, q7.y, q7.z);
+         PEACH_K_ABSORB(16, q7.w, q8.x);
          c0 = q8.y; c1 = q8.z; c2 = q8.w;
       }
-      peach_keccakf(st);
+      peach_keccakf(s);
    }
 
    /* 256-bit digest = lanes 0..3 (little-endian) */
-   out[0] = (word32) st[0]; out[1] = (word32) (st[0] >> 32);
-   out[2] = (word32) st[1]; out[3] = (word32) (st[1] >> 32);
-   out[4] = (word32) st[2]; out[5] = (word32) (st[2] >> 32);
-   out[6] = (word32) st[3]; out[7] = (word32) (st[3] >> 32);
+   out[0] = s[0]; out[1] = s[1]; out[2] = s[2]; out[3] = s[3];
+   out[4] = s[4]; out[5] = s[5]; out[6] = s[6]; out[7] = s[7];
 }  /* end peach_sh_keccak_pad() */
 
 /**
