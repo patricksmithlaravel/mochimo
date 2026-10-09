@@ -439,10 +439,14 @@ static void launch_rounds(const PEACH_PIPE_PARAMS *p,
    int r, a;
 
    if (with_init) {
+      PEACH_PIPE_PARAMS ready = *p;
+
+      peach_sha256_trailer_prefix(p->mid, p->tail, p->nonce_lo,
+         ready.sha_pre);
       memset(b->d_cnt, 0, sizeof(word32) * PEACH_PIPE_CNTZERO);
       memset(b->d_res, 0, sizeof(PEACH_PIPE_RESULT));
       CUDA_KERNEL(kcu_peach_pipe_init, l->grid_init, l->block, 0, NULL)
-         (*p, *b);
+         (ready, *b);
    }
    for (r = 0; r < PEACHROUNDS; r++) {
       if (r > 0) {
@@ -874,6 +878,7 @@ static void check_init(void)
    Par.diff = 1;
    Par.epoch = 1;
    Par.skip = 0;
+   peach_sha256_trailer_prefix(Par.mid, Par.tail, Par.nonce_lo, Par.sha_pre);
    /* pass 1: init kernel only, to learn the nonces */
    for (k = 0; k < CAP; k++) Rng0[k] = r64();
    memcpy(Bufs.d_rng, Rng0, sizeof(word64) * CAP);

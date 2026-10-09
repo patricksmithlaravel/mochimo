@@ -125,6 +125,47 @@ PEACH_DEV void peach_sha256_compress(word32 *st, word32 *w)
 
 /**
  * @private
+ * Resume a SHA-256 block at round 11 from normalized working variables.
+ * @param st Original chaining state, used for the final feed-forward
+ * @param w Original 16 big-endian message words; overwritten (schedule)
+ * @param pre Working variables a..h after rounds 0..10, without feed-forward
+*/
+PEACH_DEV void peach_sha256_compress_from11(word32 *st, word32 *w,
+   const word32 *pre)
+{
+   word32 a, b, c, d, e, f, g, h;
+
+   /* The cyclic round macros have rotated the physical names by 11. */
+   a = pre[3]; b = pre[4]; c = pre[5]; d = pre[6];
+   e = pre[7]; f = pre[0]; g = pre[1]; h = pre[2];
+   PEACH_SHA256_RND(f, g, h, a, b, c, d, e, 11, 0x550c7dc3,
+      PEACH_SHA256_W0);
+   PEACH_SHA256_RND(e, f, g, h, a, b, c, d, 12, 0x72be5d74,
+      PEACH_SHA256_W0);
+   PEACH_SHA256_RND(d, e, f, g, h, a, b, c, 13, 0x80deb1fe,
+      PEACH_SHA256_W0);
+   PEACH_SHA256_RND(c, d, e, f, g, h, a, b, 14, 0x9bdc06a7,
+      PEACH_SHA256_W0);
+   PEACH_SHA256_RND(b, c, d, e, f, g, h, a, 15, 0xc19bf174,
+      PEACH_SHA256_W0);
+   PEACH_SHA256_R8(16, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+      0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, PEACH_SHA256_WS);
+   PEACH_SHA256_R8(24, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+      0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, PEACH_SHA256_WS);
+   PEACH_SHA256_R8(32, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+      0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, PEACH_SHA256_WS);
+   PEACH_SHA256_R8(40, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+      0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, PEACH_SHA256_WS);
+   PEACH_SHA256_R8(48, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+      0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, PEACH_SHA256_WS);
+   PEACH_SHA256_R8(56, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+      0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2, PEACH_SHA256_WS);
+   st[0] += a; st[1] += b; st[2] += c; st[3] += d;
+   st[4] += e; st[5] += f; st[6] += g; st[7] += h;
+}  /* end peach_sha256_compress_from11() */
+
+/**
+ * @private
  * Set the SHA-256 initial hash value.
 */
 PEACH_DEV void peach_sha256_iv(word32 *st)
@@ -595,6 +636,82 @@ PEACH_DEV void peach_sha256_trailer(const word32 mid[8],
    hash0[6] = peach_bswap32(st[6]);
    hash0[7] = peach_bswap32(st[7]);
 }  /* end peach_sha256_trailer() */
+
+/**
+ * Precompute the 11 batch-common rounds of the trailer's second block.
+ * @param mid Chaining state after trailer bytes 0..63
+ * @param tail Trailer bytes 64..91 as 7 raw little-endian words
+ * @param nonce_lo Nonce words 0..3, shared by every slot in the batch
+ * @param pre Normalized working variables a..h, without feed-forward
+*/
+PEACH_HOST void peach_sha256_trailer_prefix(const word32 mid[8],
+   const word32 tail[7], const word32 nonce_lo[4], word32 pre[8])
+{
+   word32 a, b, c, d, e, f, g, h, w[11];
+   int i;
+
+   for (i = 0; i < 7; i++) w[i] = peach_bswap32(tail[i]);
+   for (i = 0; i < 4; i++) w[i + 7] = peach_bswap32(nonce_lo[i]);
+   a = mid[0]; b = mid[1]; c = mid[2]; d = mid[3];
+   e = mid[4]; f = mid[5]; g = mid[6]; h = mid[7];
+   PEACH_SHA256_R8(0, 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+      0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, PEACH_SHA256_W0);
+   PEACH_SHA256_RND(a, b, c, d, e, f, g, h, 8, 0xd807aa98,
+      PEACH_SHA256_W0);
+   PEACH_SHA256_RND(h, a, b, c, d, e, f, g, 9, 0x12835b01,
+      PEACH_SHA256_W0);
+   PEACH_SHA256_RND(g, h, a, b, c, d, e, f, 10, 0x243185be,
+      PEACH_SHA256_W0);
+   pre[0] = f; pre[1] = g; pre[2] = h; pre[3] = a;
+   pre[4] = b; pre[5] = c; pre[6] = d; pre[7] = e;
+}  /* end peach_sha256_trailer_prefix() */
+
+/**
+ * Trailer SHA-256 using the batch prefix from peach_sha256_trailer_prefix().
+ * The original midstate and message words remain needed for feed-forward
+ * and schedule expansion. Output has the same layout as peach_sha256_trailer().
+*/
+PEACH_DEV void peach_sha256_trailer_pre(const word32 mid[8],
+   const word32 tail[7], const word32 n[8], const word32 pre[8],
+   word32 hash0[8])
+{
+   word32 st[8], w[16];
+
+   st[0] = mid[0]; st[1] = mid[1]; st[2] = mid[2]; st[3] = mid[3];
+   st[4] = mid[4]; st[5] = mid[5]; st[6] = mid[6]; st[7] = mid[7];
+   w[0] = peach_bswap32(tail[0]);
+   w[1] = peach_bswap32(tail[1]);
+   w[2] = peach_bswap32(tail[2]);
+   w[3] = peach_bswap32(tail[3]);
+   w[4] = peach_bswap32(tail[4]);
+   w[5] = peach_bswap32(tail[5]);
+   w[6] = peach_bswap32(tail[6]);
+   w[7] = peach_bswap32(n[0]);
+   w[8] = peach_bswap32(n[1]);
+   w[9] = peach_bswap32(n[2]);
+   w[10] = peach_bswap32(n[3]);
+   w[11] = peach_bswap32(n[4]);
+   w[12] = peach_bswap32(n[5]);
+   w[13] = peach_bswap32(n[6]);
+   w[14] = peach_bswap32(n[7]);
+   w[15] = WORD32_C(0x80000000);
+   peach_sha256_compress_from11(st, w, pre);
+   /* constant length block (its schedule folds at compile time) */
+   w[0] = 0; w[1] = 0; w[2] = 0; w[3] = 0;
+   w[4] = 0; w[5] = 0; w[6] = 0; w[7] = 0;
+   w[8] = 0; w[9] = 0; w[10] = 0; w[11] = 0;
+   w[12] = 0; w[13] = 0; w[14] = 0;
+   w[15] = PEACH_HASH32_TRAILBITS;
+   peach_sha256_compress(st, w);
+   hash0[0] = peach_bswap32(st[0]);
+   hash0[1] = peach_bswap32(st[1]);
+   hash0[2] = peach_bswap32(st[2]);
+   hash0[3] = peach_bswap32(st[3]);
+   hash0[4] = peach_bswap32(st[4]);
+   hash0[5] = peach_bswap32(st[5]);
+   hash0[6] = peach_bswap32(st[6]);
+   hash0[7] = peach_bswap32(st[7]);
+}  /* end peach_sha256_trailer_pre() */
 
 /**
  * @private

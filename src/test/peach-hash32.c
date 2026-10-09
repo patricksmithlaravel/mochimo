@@ -12,8 +12,9 @@
  *     algorithm. Every tile sits against a PROT_NONE guard page (any load
  *     outside the 1024 tile bytes faults) and every output word is
  *     checked (outputs are pre-filled with garbage);
- * (2) peach_sha256_trailer() vs sha256(bt, 124), midstate from crypto-c
- *     sha256_init() / sha256_update(bt, 64);
+ * (2) peach_sha256_trailer() and the batch-prefix variant vs sha256(bt,
+ *     124), midstate from crypto-c sha256_init() / sha256_update(bt, 64);
+ *     one precomputed prefix reused across changing nonce suffixes;
  * (3) peach_sha256_final() vs sha256(hash0 || tile);
  * (4) Peach walks (mainnet vectors, then random nonces on their maps):
  *     hash0, every SHA-1/SHA-256/MD5 jump and the final hash vs the
@@ -42,6 +43,7 @@
 #include "peach_hash32.cuh"
 
 #define NRANDOM   4000  /* random cases, checks (1) to (3) */
+#define NREUSE    1000  /* nonce suffixes sharing one trailer prefix */
 #define NWALKS    64    /* random nonce walks per mainnet vector, (4) */
 #define NVECTORS  3     /* mainnet vectors (non-pseudo blocks) */
 #define NALGO     3     /* algorithms under test */
@@ -414,8 +416,8 @@ static void trailer_inputs(const BTRAILER *bt, word32 *mid, word32 *tail,
 static void check_trailer(void)
 {
    BTRAILER bt;
-   word32 mid[8], tail[7], n[8], h[8], ref[8];
-   word64 bad = 0;
+   word32 mid[8], tail[7], n[8], h[8], hp[8], pre[8], ref[8];
+   word64 bad = 0, badpre = 0, badreuse = 0;
    int i;
 
    ASSERT_EQ((offsetof(BTRAILER, nonce)), (92));
@@ -426,7 +428,10 @@ static void check_trailer(void)
       else rand_bytes(&bt, sizeof(bt));
       trailer_inputs(&bt, mid, tail, n);
       memset(h, 0x5A, sizeof(h));
+      memset(hp, 0x5A, sizeof(hp));
       peach_sha256_trailer(mid, tail, n, h);
+      peach_sha256_trailer_prefix(mid, tail, n, pre);
+      peach_sha256_trailer_pre(mid, tail, n, pre, hp);
       sha256(&bt, 124, ref);
       if (memcmp(h, ref, 32) != 0) {
          if (bad++ == 0) {
@@ -435,11 +440,43 @@ static void check_trailer(void)
             print_words("got", h);
          }
       }
+      if (memcmp(hp, ref, 32) != 0) {
+         if (badpre++ == 0) {
+            printf("(2) trailer prefix mismatch, case %d:\n", i);
+            print_words("ref", ref);
+            print_words("got", hp);
+         }
+      }
    }
-   printf("(2) trailer: %d cases, mismatches %llu\n",
-      NRANDOM + NVECTORS + 2, (unsigned long long) bad);
-   Fails += bad;
+   /* The first 108 trailer bytes stay fixed; only nonce words 4..7 vary. */
+   rand_bytes(&bt, sizeof(bt));
+   trailer_inputs(&bt, mid, tail, n);
+   peach_sha256_trailer_prefix(mid, tail, n, pre);
+   for (i = 0; i < NREUSE; i++) {
+      rand_bytes(bt.nonce + 16, 16);
+      memcpy(n + 4, bt.nonce + 16, 16);
+      memset(h, 0x5A, sizeof(h));
+      memset(hp, 0x5A, sizeof(hp));
+      peach_sha256_trailer(mid, tail, n, h);
+      peach_sha256_trailer_pre(mid, tail, n, pre, hp);
+      sha256(&bt, 124, ref);
+      if (memcmp(h, ref, 32) != 0 || memcmp(hp, ref, 32) != 0) {
+         if (badreuse++ == 0) {
+            printf("(2) reused trailer prefix mismatch, case %d:\n", i);
+            print_words("ref", ref);
+            print_words("original", h);
+            print_words("prefix", hp);
+         }
+      }
+   }
+   printf("(2) trailer: %d cases, mismatches %llu, prefix mismatches %llu; "
+      "%d suffixes with one prefix, mismatches %llu\n", NRANDOM + NVECTORS + 2,
+      (unsigned long long) bad, (unsigned long long) badpre, NREUSE,
+      (unsigned long long) badreuse);
+   Fails += bad + badpre + badreuse;
    ASSERT_EQ((bad), (0));
+   ASSERT_EQ((badpre), (0));
+   ASSERT_EQ((badreuse), (0));
 }
 
 /* (3) final SHA-256 of hash0 || tile */

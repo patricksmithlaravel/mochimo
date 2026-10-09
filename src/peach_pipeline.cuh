@@ -158,7 +158,7 @@ typedef struct {
 } PEACH_PIPE_SLOT;
 
 /**
- * Per-batch constants, passed BY VALUE to every kernel. 104 bytes.
+ * Per-batch constants, passed BY VALUE to every kernel. 136 bytes.
  * Device code indexes the arrays with constants only, and reads the
  * skip mask of a round with a shift (never `p.skip[round]`): a runtime
  * index into a by-value kernel parameter copies the whole structure to
@@ -178,6 +178,7 @@ typedef struct {
                            round r (bit a = drop a nonce whose jump in
                            round r uses algo a), see
                            peach_pipe_skip_pack() */
+   word32 sha_pre[8];   /**< SHA256 working state after second-block round 10 */
 } PEACH_PIPE_PARAMS;
 
 /**
@@ -263,7 +264,7 @@ typedef char peach_pipe_slot_size_check[
 typedef char peach_pipe_trace_size_check[
    sizeof(PEACH_PIPE_TRACE) == 80 ? 1 : -1];
 typedef char peach_pipe_params_size_check[
-   sizeof(PEACH_PIPE_PARAMS) == 104 ? 1 : -1];
+   sizeof(PEACH_PIPE_PARAMS) == 136 ? 1 : -1];
 typedef char peach_pipe_md2pre_size_check[
    sizeof(PEACH_PIPE_MD2PRE) == 32 ? 1 : -1];
 typedef char peach_pipe_result_size_check[
@@ -807,7 +808,7 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
    kcu_peach_pipe_init(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b)
 {
    const word32 mask = peach_pipe_skip_mask(p.skip, 0);
-   word32 mid[8], tail[7], n8[8], h0[8], base, k, i, m, pf, algo;
+   word32 mid[8], tail[7], pre[8], n8[8], h0[8], base, k, i, m, pf, algo;
    word64 seed;
    PEACH_PIPE_TRACE *t;
    uint4 st;
@@ -816,6 +817,8 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
    /* batch constants: constant indices only (kernel parameters) */
    PEACH_PIPE_UNROLL
    for (i = 0; i < 8; i++) mid[i] = p.mid[i];
+   PEACH_PIPE_UNROLL
+   for (i = 0; i < 8; i++) pre[i] = p.sha_pre[i];
    PEACH_PIPE_UNROLL
    for (i = 0; i < 7; i++) tail[i] = p.tail[i];
    for (base = blockIdx.x * blockDim.x; base < p.nslots;
@@ -829,7 +832,7 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
          n8[2] = p.nonce_lo[2]; n8[3] = p.nonce_lo[3];
          seed = peach_pipe_rand64(&b.d_rng[k]);
          peach_pipe_frame(seed, &n8[4]);
-         peach_sha256_trailer(mid, tail, n8, h0);
+         peach_sha256_trailer_pre(mid, tail, n8, pre, h0);
          /* mario0 = product of the 32 hash0 bytes, mod 2^32 */
          m = 1;
          PEACH_PIPE_UNROLL
@@ -1312,6 +1315,7 @@ PEACH_HOST cudaError_t peach_pipe_launch_sort(const PEACH_PIPE_PARAMS *p,
 PEACH_HOST int peach_pipe_enqueue(const PEACH_PIPE_PARAMS *p,
    const PEACH_PIPE_BUFS *b, const PEACH_PIPE_LAUNCH *l, cudaStream_t s)
 {
+   PEACH_PIPE_PARAMS ready;
    cudaError_t err;
    word32 mask;
    int r, a;
@@ -1332,12 +1336,14 @@ PEACH_HOST int peach_pipe_enqueue(const PEACH_PIPE_PARAMS *p,
       return (-1);
    }
 
+   ready = *p;
+   peach_sha256_trailer_prefix(p->mid, p->tail, p->nonce_lo, ready.sha_pre);
    err = PEACH_MEMSET_ASYNC(b->d_cnt, 0,
       sizeof(word32) * PEACH_PIPE_CNTZERO, s);
    if (err != cudaSuccess) return (int) err;
    err = PEACH_MEMSET_ASYNC(b->d_res, 0, sizeof(PEACH_PIPE_RESULT), s);
    if (err != cudaSuccess) return (int) err;
-   CUDA_KERNEL(kcu_peach_pipe_init, l->grid_init, l->block, 0, s)(*p, *b);
+   CUDA_KERNEL(kcu_peach_pipe_init, l->grid_init, l->block, 0, s)(ready, *b);
    err = cudaGetLastError();
    if (err != cudaSuccess) return (int) err;
    for (r = 0; r < PEACHROUNDS; r++) {
