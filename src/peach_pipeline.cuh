@@ -126,6 +126,11 @@ static __device__ __forceinline__ word64 cu_rand64(word64 *d_state)
    that is not in the next round's queues */
 #define PEACH_PIPE_PSHIFT     20    /**< position of P & 7 in the tile
                                        word of a slot state */
+#define PEACH_PIPE_STATE_MASK (PEACHCACHELEN_M1 | (WORD32_C(7) << \
+   PEACH_PIPE_PSHIFT))
+#define PEACH_PIPE_NEXTSHIFT  (PEACH_PIPE_PSHIFT + 3)
+#define PEACH_PIPE_NEXTMASK   (WORD32_C(7) << PEACH_PIPE_NEXTSHIFT)
+#define PEACH_PIPE_ENTRYDEAD  WORD32_C(0x80000000)
 #define PEACH_PIPE_SCANGRID   8     /**< blocks of a scan launch (one per
    queue of the round) */
 
@@ -145,16 +150,17 @@ static __device__ __forceinline__ word64 cu_rand64(word64 *d_state)
 
 /**
  * State of a slot (nonce) in a round: of round 0 in the slot states
- * (d_slot, written by init), of rounds 1..7 and the final round in the
- * entries of the tile ordered queues (d_ent). 16 bytes, one uint4.
+ * (d_slot, written by init), then alternating packed queues: odd rounds
+ * in d_ent, even rounds (including final round 8) in d_slot. 16 bytes.
 */
 typedef struct {
    word32 seed[2];      /**< the slot's frame random number (low, high
                            word): nonce words 4..7 are
                            peach_pipe_frame(seed) */
    word32 tile;         /**< tile index of the round | (P & 7) << 20,
-                           P = op after nonce words 0..7 */
-   word32 id;           /**< slot number */
+                           P = op after nonce words 0..7; a producer
+                           temporarily adds next-algorithm/dead bits */
+   word32 id;           /**< original slot number, unchanged by packing */
 } PEACH_PIPE_SLOT;
 
 /**
@@ -229,20 +235,17 @@ typedef struct {
    const word16 *d_T;         /**< transition table, PEACHCACHELEN */
    word64 *d_rng;             /**< RNG state, cap (after init: the
                                  frame random number of the batch) */
-   PEACH_PIPE_SLOT *d_slot;   /**< slot states of round 0, cap */
+   PEACH_PIPE_SLOT *d_slot;   /**< initial states, then even-round queues, cap */
    word32 *d_hash;            /**< hash0 per slot, cap * 8 */
    word32 *d_q;               /**< round 0 queues (slot numbers),
                                  PEACH_PIPE_NQUEUE * cap: algo a at a * cap */
-   PEACH_PIPE_SLOT *d_ent;    /**< entries of the tile ordered queues of
-                                 the current round (1..7) or of the final
-                                 queue, cap: queue a after the queues
-                                 0..a-1 of its round */
+   PEACH_PIPE_SLOT *d_ent;    /**< odd-round packed queues, cap: queue a
+                                 after queues 0..a-1 of its round */
    word32 *d_cnt;             /**< counters, PEACH_PIPE_CNTWORDS:
                                  cnt(r, a) = d_cnt[(r*8 + a) * 32], then
                                  the tile histograms and cursors */
-   word32 *d_key;             /**< sort key per slot, cap: queue and tile
-                                 of the slot's next queue entry
-                                 (PEACH_PIPE_KEYDEAD: none) */
+   word32 *d_key;             /**< round-0 output key per original slot,
+                                 cap; unused after the first scatter */
    PEACH_PIPE_RESULT *d_res;  /**< batch result */
    PEACH_PIPE_TRACE *d_trace; /**< optional trace, cap (or NULL) */
    word32 cap;                /**< queue capacity (= max slots) */
@@ -261,6 +264,11 @@ typedef struct {
 /* compile time size checks */
 typedef char peach_pipe_slot_size_check[
    sizeof(PEACH_PIPE_SLOT) == 16 ? 1 : -1];
+typedef char peach_pipe_entry_bits_check[
+   (PEACHCACHELEN_M1 == ((WORD32_C(1) << PEACH_PIPE_PSHIFT) - 1) &&
+    (PEACH_PIPE_STATE_MASK & PEACH_PIPE_NEXTMASK) == 0 &&
+    ((PEACH_PIPE_STATE_MASK | PEACH_PIPE_NEXTMASK) &
+       PEACH_PIPE_ENTRYDEAD) == 0) ? 1 : -1];
 typedef char peach_pipe_trace_size_check[
    sizeof(PEACH_PIPE_TRACE) == 80 ? 1 : -1];
 typedef char peach_pipe_params_size_check[
@@ -323,17 +331,19 @@ PEACH_HD word64 peach_pipe_skip_pack(const word8 masks[8])
  * - Round 0: init appends slot numbers to q[a] (d_q + a * cap), unordered
  *   (mario0 is tile 0 for most nonces); the hash kernels read the slot
  *   states (d_slot).
- * - Rounds 1..7 and the final queue: entries (the slot states of that
- *   round) in d_ent, queue (r, a) at offset off(r, a) = cnt(r, 0) + .. +
+ * - Rounds 1..7 and the final queue: entries alternate between d_ent
+ *   (odd rounds) and d_slot (even rounds), queue (r, a) at offset
+ *   off(r, a) = cnt(r, 0) + .. +
  *   cnt(r, a - 1), in ascending tile bucket order (tile >>
  *   PEACH_PIPE_SORT_SHIFT). A hash kernel of round r - 1 stores each
- *   surviving slot's next queue and tile as the slot's key (d_key) and
- *   counts it in that queue's tile bucket histogram; then
+ *   next queue/tile or dead marker in its own incoming entry and counts
+ *   survivors in the next queue's tile bucket histogram; then
  *   kcu_peach_pipe_scan() turns the histograms of round r into bucket
  *   cursors and the counters cnt(r, a), and kcu_peach_pipe_scatter()
- *   sweeps the keys of all slots and stores the state of each live slot,
- *   with its next tile, at the next index of its bucket (a counting
- *   sort). The hash and final kernels so read their entries sequentially
+ *   sweeps the incoming packed prefix and copies live entries to the
+ *   other buffer, clearing temporary metadata (a counting sort). Only
+ *   the first scatter sweeps all original slots using d_key. The hash
+ *   and final kernels so read their entries sequentially
  *   and the map in ascending tile order.
  * Each slot enters at most one queue per round, so with cap >= nslots no
  * queue can overflow; consumers still read only entries below cap, and an
@@ -621,6 +631,22 @@ PEACH_HD word32 peach_pipe_qlen(word32 cnt, word32 off, word32 cap)
    return cnt < cap - off ? cnt : cap - off;
 }  /* end peach_pipe_qlen() */
 
+/** Packed queue storage: odd rounds in d_ent, even rounds in d_slot. */
+PEACH_HD PEACH_PIPE_SLOT *peach_pipe_entries(PEACH_PIPE_BUFS b, word32 r)
+{
+   return (r & 1) ? b.d_ent : b.d_slot;
+}
+
+/** Number of stored entries in a round's packed queues. */
+PEACH_DEV word32 peach_pipe_packed_len(const word32 *cnt, word32 cap)
+{
+   word32 n = 0, a;
+
+   PEACH_PIPE_UNROLL
+   for (a = 0; a < 8; a++) n += PEACH_LDG32(&cnt[a * PEACH_PIPE_CNTPAD]);
+   return n < cap ? n : cap;
+}
+
 /**
  * @private
  * Final queue entry whose nonce is the canary of a batch: a position
@@ -671,13 +697,10 @@ PEACH_DEV void peach_pipe_hash(word32 algo, const word32 *n, word32 m,
  * @private
  * Body of the hash kernel of algorithm @a algo in round @a round: for
  * each entry of queue (round, algo), hash the slot's jump seed view,
- * select the next algorithm (rounds 0..6) and, unless that round's skip
- * mask drops the slot, store its key (next queue << 20 | next tile) and
- * count it in the tile histogram of that queue; round 7 does so for the
- * final queue. A dropped slot gets the key PEACH_PIPE_KEYDEAD.
- * kcu_peach_pipe_scatter() then builds the queues of round + 1: each
- * entry is the slot's round 0 state (d_slot, which keeps P & 7) with the
- * tile of the key.
+ * select the next algorithm (rounds 0..6) and count survivors in the
+ * next round's tile histogram. Round 0 writes d_key; later rounds write
+ * next-algorithm/tile or dead metadata in their own incoming entry.
+ * Scatter copies survivors to the other buffer, preserving seed/P/id.
  * @param p Batch parameters
  * @param b Batch buffers
  * @param round Round number, 0..7
@@ -692,7 +715,7 @@ PEACH_DEV void peach_pipe_round(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b,
    const int last = (r == PEACHROUNDS - 1);
    const word32 *cnt = b.d_cnt + (r * 8 * PEACH_PIPE_CNTPAD);
    const word32 *qin = b.d_q + (algo * b.cap);
-   const PEACH_PIPE_SLOT *ein;
+   PEACH_PIPE_SLOT *ein;
    /* tile histograms of the round r + 1 queues (or the final queue) */
    word32 *hist = b.d_cnt + PEACH_PIPE_HISTOFF +
       (r * 8 * PEACH_PIPE_NBUCKET);
@@ -706,7 +729,7 @@ PEACH_DEV void peach_pipe_round(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b,
    off = r == 0 ? 0 : peach_pipe_qoff(cnt, algo);
    n = peach_pipe_qlen(PEACH_LDG32(&cnt[algo * PEACH_PIPE_CNTPAD]), off,
       b.cap);
-   ein = b.d_ent + off;
+   ein = peach_pipe_entries(b, r);
    for (base = blockIdx.x * blockDim.x; base < n;
          base += gridDim.x * blockDim.x) {
       k = base + threadIdx.x;
@@ -716,13 +739,13 @@ PEACH_DEV void peach_pipe_round(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b,
       if (valid) {
          /* slot state: round 0 from the slot queue, else the entry */
          w = PEACH_LDG128(r == 0 ? &b.d_slot[PEACH_LDG32(&qin[k])] :
-            &ein[k]);
+            &ein[off + k]);
          /* nonce: words 0..3 per batch, words 4..7 per slot */
          n8[0] = p.nonce_lo[0]; n8[1] = p.nonce_lo[1];
          n8[2] = p.nonce_lo[2]; n8[3] = p.nonce_lo[3];
          peach_pipe_frame(((word64) w.y << 32) | w.x, &n8[4]);
          m = w.z & PEACHCACHELEN_M1;
-         pf = w.z >> PEACH_PIPE_PSHIFT;
+         pf = (w.z >> PEACH_PIPE_PSHIFT) & 7;
          slot = w.w;
          /* jump: next tile = sum of the digest words */
          peach_pipe_hash(algo, n8, m,
@@ -738,8 +761,14 @@ PEACH_DEV void peach_pipe_round(PEACH_PIPE_PARAMS p, PEACH_PIPE_BUFS b,
          if (keep) {
             PEACH_ATOMIC_ADD32(&hist[(key * PEACH_PIPE_NBUCKET) +
                (m >> PEACH_PIPE_SORT_SHIFT)], 1);
-            b.d_key[slot] = (key << PEACH_PIPE_KEYSHIFT) | m;
-         } else b.d_key[slot] = PEACH_PIPE_KEYDEAD;
+         }
+         if (r == 0) {
+            b.d_key[slot] = keep ? (key << PEACH_PIPE_KEYSHIFT) | m :
+               PEACH_PIPE_KEYDEAD;
+         } else {
+            ein[off + k].tile = m | (pf << PEACH_PIPE_PSHIFT) |
+               (keep ? key << PEACH_PIPE_NEXTSHIFT : PEACH_PIPE_ENTRYDEAD);
+         }
       }
       peach_pipe_count_drop(drop, b.d_res);
       if (valid && b.d_trace != NULL) {
@@ -1050,12 +1079,13 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
 
 /**
  * CUDA kernel building the queues of round @a round (1..7; 8: the final
- * queue) in tile bucket order: for each slot k < p.nslots with a live key
- * (queue a, tile m), take the next index of bucket m >> SORT_SHIFT of
- * queue a from its cursor (kcu_peach_pipe_scan()) and store there, at
- * offset off(round, a) in d_ent, the state of slot k with tile m. An
+ * queue) in tile bucket order. Round 1 sweeps all original d_key entries;
+ * later rounds sweep only the previous round's stored packed prefix.
+ * Each live entry takes its bucket cursor's next position in the other
+ * buffer, with temporary next-algorithm/dead metadata removed. An
  * index >= cap (never with cap >= nslots) counts in the result's
- * overflow, kills the key and marks the slot lost. Any grid size >= 1.
+ * overflow, kills the input key/entry and marks its original slot lost.
+ * Any grid size >= 1.
  * @param p Batch parameters
  * @param b Batch buffers
  * @param round Round of the queues, 1..8
@@ -1066,11 +1096,16 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
 {
    const word32 rr = (word32) round;
    const word32 *cnt;
+   PEACH_PIPE_SLOT *src, *dst;
    word32 *cur = b.d_cnt + PEACH_PIPE_CUROFF;
-   word32 qoff[8], k, key, a, i, pos;
+   word32 qoff[8], k, key, a, i, pos, n, slot;
    uint4 e;
 
    if (rr < 1 || rr > PEACHROUNDS) return;
+   src = peach_pipe_entries(b, rr - 1);
+   dst = peach_pipe_entries(b, rr);
+   n = rr == 1 ? p.nslots : peach_pipe_packed_len(b.d_cnt +
+      ((rr - 1) * 8 * PEACH_PIPE_CNTPAD), b.cap);
    /* queue offsets of the round (constant indices: registers) */
    cnt = b.d_cnt + (rr * 8 * PEACH_PIPE_CNTPAD);
    qoff[0] = 0;
@@ -1078,11 +1113,17 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
    for (i = 1; i < 8; i++) {
       qoff[i] = qoff[i - 1] + PEACH_LDG32(&cnt[(i - 1) * PEACH_PIPE_CNTPAD]);
    }
-   for (k = (blockIdx.x * blockDim.x) + threadIdx.x; k < p.nslots;
+   for (k = (blockIdx.x * blockDim.x) + threadIdx.x; k < n;
          k += gridDim.x * blockDim.x) {
-      key = b.d_key[k];
-      if (key == PEACH_PIPE_KEYDEAD) continue;
-      a = (key >> PEACH_PIPE_KEYSHIFT) & 7;
+      if (rr == 1) {
+         key = b.d_key[k];
+         if (key == PEACH_PIPE_KEYDEAD) continue;
+         a = (key >> PEACH_PIPE_KEYSHIFT) & 7;
+      } else {
+         key = PEACH_LDG32(&src[k].tile);
+         if (key & PEACH_PIPE_ENTRYDEAD) continue;
+         a = (key >> PEACH_PIPE_NEXTSHIFT) & 7;
+      }
       pos = 0;
       PEACH_PIPE_UNROLL
       for (i = 1; i < 8; i++) {
@@ -1091,14 +1132,19 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
       pos += PEACH_ATOMIC_ADD32(&cur[(a * PEACH_PIPE_NBUCKET) +
          ((key & PEACHCACHELEN_M1) >> PEACH_PIPE_SORT_SHIFT)], 1);
       if (pos < b.cap) {
-         e = PEACH_LDG128(&b.d_slot[k]);
-         e.z = (e.z & ~((word32) PEACHCACHELEN_M1)) |
-            (key & PEACHCACHELEN_M1);
-         *((uint4 *) &b.d_ent[pos]) = e;
+         e = PEACH_LDG128(&src[k]);
+         e.z = rr == 1 ? (e.z & (PEACH_PIPE_STATE_MASK &
+            ~((word32) PEACHCACHELEN_M1))) | (key & PEACHCACHELEN_M1) :
+            key & PEACH_PIPE_STATE_MASK;
+         *((uint4 *) &dst[pos]) = e;
       } else {
          PEACH_ATOMIC_ADD32(&b.d_res->overflow, 1);
-         b.d_key[k] = PEACH_PIPE_KEYDEAD;
-         if (b.d_trace != NULL) b.d_trace[k].drop_round = PEACH_PIPE_LOST;
+         if (rr == 1) b.d_key[k] = PEACH_PIPE_KEYDEAD;
+         else src[k].tile = key | PEACH_PIPE_ENTRYDEAD;
+         if (b.d_trace != NULL) {
+            slot = rr == 1 ? k : PEACH_LDG32(&src[k].id);
+            b.d_trace[slot].drop_round = PEACH_PIPE_LOST;
+         }
       }
    }
 }  /* end kcu_peach_pipe_scatter() */
@@ -1131,7 +1177,7 @@ PEACH_KERNEL void __launch_bounds__(PEACH_PIPE_BLOCK)
       valid = (k < n);
       if (valid) {
          /* final queue entry: nonce words 4..7, final tile, slot */
-         w = PEACH_LDG128(&b.d_ent[k]);
+         w = PEACH_LDG128(&peach_pipe_entries(b, PEACHROUNDS)[k]);
          peach_pipe_frame(((word64) w.y << 32) | w.x, n4);
          nv.x = n4[0]; nv.y = n4[1]; nv.z = n4[2]; nv.w = n4[3];
          m = w.z & PEACHCACHELEN_M1;
@@ -1277,7 +1323,7 @@ PEACH_HOST void peach_pipe_launch_hash(int algo, int grid, int block,
  * @private
  * Launch the tile sort of the queues of round @a round (1..7; 8: the
  * final queue): kcu_peach_pipe_scan(), then kcu_peach_pipe_scatter()
- * (grid l->grid_init, as the init kernel: one item per slot).
+ * (grid l->grid_init; after round 1, one item per incoming packed entry).
  * @note Internal to peach_pipe_enqueue() (validated launch shape).
  * @returns cudaSuccess, or the error of a failed launch
 */
