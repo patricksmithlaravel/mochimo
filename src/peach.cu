@@ -1236,7 +1236,8 @@ static void peach_cuda_config(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
  * @private
  * Default (automatic) skip masks of the pipeline solver for the current
  * CUDA device, used when MCM_PEACH_SKIP is unset (or invalid): on
- * devices of compute capability PEACH_CUDA_SKIP_LATE_CC.x, MD2 jumps are
+ * the desktop RTX 4090 (cc 8.9), or devices of compute capability
+ * PEACH_CUDA_SKIP_LATE_CC.x, MD2 jumps are
  * dropped in rounds 0..PEACH_CUDA_SKIP_LATE_ROUND - 1 and evaluated in
  * the later rounds, and round 0 also drops SHA-256, SHA3 and Keccak
  * jumps (masks PEACH_CUDA_SKIP_LATE_R0, 0x40 x 3, then 0x00 x 4); on
@@ -1266,7 +1267,8 @@ static void peach_cuda_config(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
 */
 static int peach_cuda_skip_default(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
 {
-   int major = 0, i;
+   cudaDeviceProp prop;
+   int major = 0, rtx4090 = 0, i;
 
    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
          ctx->id) != cudaSuccess) {
@@ -1274,7 +1276,18 @@ static int peach_cuda_skip_default(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
       (void) cudaGetLastError();
       major = 0;
    }
-   if (P->cfg_skip_auto && major == PEACH_CUDA_SKIP_LATE_CC) {
+   /* Apply the measured Ada policy only to the tested desktop model. */
+   if (P->cfg_skip_auto && major == 8) {
+      if (cudaGetDeviceProperties(&prop, ctx->id) == cudaSuccess) {
+         rtx4090 = prop.major == 8 && prop.minor == 9 &&
+            strcmp(prop.name, "NVIDIA GeForce RTX 4090") == 0;
+      } else {
+         /* Optional profile query: keep generic masks if unavailable. */
+         (void) cudaGetLastError();
+      }
+   }
+   if (P->cfg_skip_auto &&
+         (major == PEACH_CUDA_SKIP_LATE_CC || rtx4090)) {
       for (i = 0; i < 8; i++) {
          P->cfg_skip[i] = i < PEACH_CUDA_SKIP_LATE_ROUND ?
             PEACH_PIPE_SKIP_MD2 : 0;
