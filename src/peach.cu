@@ -145,6 +145,8 @@ typedef struct {
                                           peach_cuda_skip_default()) */
    word32 cfg_batch;                   /**< MCM_PEACH_BATCH (0 = auto) */
    int cfg_nctx;                       /**< MCM_PEACH_STREAMS (0 = auto) */
+   int auto_rtx3090;                   /**< exact desktop 3090 profile,
+                                          cached by the auto mask query */
    /* solver mode and safety */
    int mode;                           /**< PEACH_CUDA_MODE_* in use */
    int fallback;                       /**< pipeline abandoned for the
@@ -1241,8 +1243,9 @@ static void peach_cuda_config(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
  * dropped in rounds 0..PEACH_CUDA_SKIP_LATE_ROUND - 1 and evaluated in
  * the later rounds, and round 0 also drops SHA-256, SHA3 and Keccak
  * jumps (masks PEACH_CUDA_SKIP_LATE_R0, 0x40 x 3, then 0x00 x 4); on
- * every other device (not measured), MD2 jumps are dropped in every
- * round (0x40 x 8).
+ * the desktop RTX 3090 (cc 8.6), only late MD2 retention is selected:
+ * masks 0x40 x 4, then 0x00 x 4, without changing round 0 or sizing.
+ * Every other device uses masks 0x40 in all eight rounds.
  * <br />
  * An MD2 jump costs several other jumps, and dropping a nonce loses the
  * jumps already spent on it. Early in its walk a nonce has cost little
@@ -1270,17 +1273,21 @@ static int peach_cuda_skip_default(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
    cudaDeviceProp prop;
    int major = 0, rtx4090 = 0, i;
 
+   P->auto_rtx3090 = 0;
+
    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
          ctx->id) != cudaSuccess) {
       /* clear the (non-sticky) error; keep the generic masks */
       (void) cudaGetLastError();
       major = 0;
    }
-   /* Apply the measured Ada policy only to the tested desktop model. */
+   /* Cache exact desktop profiles; optional query failure stays generic. */
    if (P->cfg_skip_auto && major == 8) {
       if (cudaGetDeviceProperties(&prop, ctx->id) == cudaSuccess) {
          rtx4090 = prop.major == 8 && prop.minor == 9 &&
             strcmp(prop.name, "NVIDIA GeForce RTX 4090") == 0;
+         P->auto_rtx3090 = prop.major == 8 && prop.minor == 6 &&
+            strcmp(prop.name, "NVIDIA GeForce RTX 3090") == 0;
       } else {
          /* Optional profile query: keep generic masks if unavailable. */
          (void) cudaGetLastError();
@@ -1293,6 +1300,12 @@ static int peach_cuda_skip_default(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
             PEACH_PIPE_SKIP_MD2 : 0;
       }
       P->cfg_skip[0] = PEACH_CUDA_SKIP_LATE_R0;
+   }
+   if (P->cfg_skip_auto && P->auto_rtx3090) {
+      for (i = 0; i < 8; i++) {
+         P->cfg_skip[i] = i < PEACH_CUDA_SKIP_LATE_ROUND ?
+            PEACH_PIPE_SKIP_MD2 : 0;
+      }
    }
 
    return major;
