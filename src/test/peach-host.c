@@ -1899,6 +1899,113 @@ static void expect_fallback(const char *what, unsigned long alerts)
    CHECK(R.bad == bad0, "%s: invalid solve reported", what);
 }  /* end expect_fallback() */
 
+/** Automatic model profiles and hardware-derived sizing, without map work. */
+static void scenario_profiles(void)
+{
+   static const struct {
+      const char *name, *model;
+      int major, minor;
+      const char *skip, *batch, *streams, *fault;
+      int masks; /* 0: generic, 1: selected late MD2, 2: full evaluation */
+      word32 slots_per_thread;
+      int contexts, properties_queries;
+   } profiles[] = {
+      { "4090 automatic", "NVIDIA GeForce RTX 4090", 8, 9,
+         NULL, NULL, NULL, NULL, 1, 64, 3, 1 },
+      { "5090 automatic", "NVIDIA GeForce RTX 5090", 12, 0,
+         NULL, NULL, NULL, NULL, 1, 64, 3, 0 },
+      { "other cc12", "Other cc12 device", 12, 1,
+         NULL, NULL, NULL, NULL, 1, 64, 3, 0 },
+      { "other Ada", "NVIDIA GeForce RTX 4080", 8, 9,
+         NULL, NULL, NULL, NULL, 0, 32, 3, 1 },
+      { "4090 D", "NVIDIA GeForce RTX 4090 D", 8, 9,
+         NULL, NULL, NULL, NULL, 0, 32, 3, 1 },
+      { "4090 Laptop", "NVIDIA GeForce RTX 4090 Laptop GPU", 8, 9,
+         NULL, NULL, NULL, NULL, 0, 32, 3, 1 },
+      { "4090 wrong capability", "NVIDIA GeForce RTX 4090", 8, 6,
+         NULL, NULL, NULL, NULL, 0, 32, 3, 1 },
+      { "properties query failure", "NVIDIA GeForce RTX 4090", 8, 9,
+         NULL, NULL, NULL, "cudaGetDeviceProperties", 0, 32, 3, 1 },
+      { "major query failure", "NVIDIA GeForce RTX 4090", 8, 9,
+         NULL, NULL, NULL, "cudaDeviceGetAttribute", 0, 32, 3, 0 },
+      { "4090 after failed query", "NVIDIA GeForce RTX 4090", 8, 9,
+         NULL, NULL, NULL, NULL, 1, 64, 3, 1 },
+      { "manual MD2 skip", "NVIDIA GeForce RTX 4090", 8, 9,
+         "0x40", NULL, NULL, NULL, 0, 32, 3, 0 },
+      { "manual full evaluation", "NVIDIA GeForce RTX 4090", 8, 9,
+         "0", NULL, NULL, NULL, 2, 32, 3, 0 },
+      { "manual selected masks", "NVIDIA GeForce RTX 4090", 8, 9,
+         "0x78,0x40,0x40,0x40,0,0,0,0", NULL, NULL, NULL, 1, 64, 3, 0 },
+      { "explicit batch and streams", "NVIDIA GeForce RTX 4090", 8, 9,
+         NULL, "6291456", "2", NULL, 1, 32, 2, 1 },
+      { "zero requests automatic", "NVIDIA GeForce RTX 4090", 8, 9,
+         NULL, "0", "0", NULL, 1, 64, 3, 1 },
+      { "invalid requests automatic", "NVIDIA GeForce RTX 4090", 8, 9,
+         "invalid", "invalid", "invalid", NULL, 1, 64, 3, 1 }
+   };
+   const EMU_RT_DEVICE saved = emu_rt.dev;
+   const int thread = emu_rt.thread;
+   DEVICE_CTX device;
+   PEACH_CUDA_CTX profile;
+   unsigned long queries;
+   word32 want;
+   int i, j, major;
+
+   section("Automatic GPU profiles and sizing");
+   memset(&device, 0, sizeof(device));
+   emu_rt_thread(DEVICE_THREAD);
+   for (i = 0; i < (int) (sizeof(profiles) / sizeof(profiles[0])); i++) {
+      emu_rt.dev = saved;
+      emu_rt.dev.sms = profiles[i].major == 12 ? 170 : 128;
+      emu_rt.dev.max_threads_sm = 1536;
+      emu_rt.dev.total_mem = (size_t) 24 << 30;
+      emu_rt.dev.cc_major = profiles[i].major;
+      emu_rt.dev.cc_minor = profiles[i].minor;
+      snprintf(emu_rt.dev.name, sizeof(emu_rt.dev.name), "%s", profiles[i].model);
+      env_config("0", profiles[i].skip, profiles[i].batch);
+      if (profiles[i].streams) setenv("MCM_PEACH_STREAMS", profiles[i].streams, 1);
+      else unsetenv("MCM_PEACH_STREAMS");
+      memset(&profile, 0, sizeof(profile));
+      peach_cuda_config(&device, &profile);
+      queries = emu_rt_calls("cudaGetDeviceProperties");
+      if (profiles[i].fault) emu_rt_fault(profiles[i].fault, 1, cudaErrorInvalidValue, 0);
+      major = peach_cuda_skip_default(&device, &profile);
+      CHECK(major == (profiles[i].fault && strcmp(profiles[i].fault,
+         "cudaDeviceGetAttribute") == 0 ? 0 : profiles[i].major), "%s: major %d",
+         profiles[i].name, major);
+      CHECK(emu_rt_calls("cudaGetDeviceProperties") - queries ==
+         (unsigned long) profiles[i].properties_queries, "%s: property query count",
+         profiles[i].name);
+      CHECK(emu_rt_fault_clear() == (profiles[i].fault ? 1UL : 0UL),
+         "%s: query fault coverage", profiles[i].name);
+      CHECK(cudaGetLastError() == cudaSuccess, "%s: query error not cleared", profiles[i].name);
+      for (j = 0; j < 8; j++) {
+         const word8 expected = profiles[i].masks == 1 ?
+            (j == 0 ? 0x78 : j < 4 ? 0x40 : 0) : profiles[i].masks == 2 ? 0 : 0x40;
+         CHECK(profile.cfg_skip[j] == expected, "%s: mask[%d] = 0x%x",
+            profiles[i].name, j, (unsigned) profile.cfg_skip[j]);
+      }
+      CHECK(peach_cuda_sizing(&device, &profile, 0) == VEOK, "%s: sizing", profiles[i].name);
+      want = profiles[i].slots_per_thread * (word32) emu_rt.dev.sms * 1536;
+      CHECK(profile.cap == want && profile.nslots == want &&
+         profile.nctx == profiles[i].contexts, "%s: slots %u / contexts %d",
+         profiles[i].name, (unsigned) profile.nslots, profile.nctx);
+      if (i == 0) {
+         CHECK(profile.nslots == 12582912, "4090 automatic measured slot count");
+         emu_rt.dev.total_mem = (size_t) 1 << 30;
+         CHECK(peach_cuda_sizing(&device, &profile, 0) == VEOK &&
+            profile.nctx == PEACH_CUDA_NCTX_MIN && profile.cap < want &&
+            profile.cap % PEACH_PIPE_BLOCK == 0 && profile.nslots <= profile.cap,
+            "4090 automatic memory clamping and context fallback");
+      }
+      printf("   %s: masks and sizing verified\n", profiles[i].name);
+   }
+   emu_rt.dev = saved;
+   emu_rt_thread(thread);
+   env_config("0", NULL, NULL);
+   section_end(NULL);
+}  /* end scenario_profiles() */
+
 /**
  * Pipeline scenarios: (2), (4), (3), (8), (9), (5), (6), (7), (10).
 */
@@ -2390,7 +2497,7 @@ int main(void)
    Verbose = (int) env_long("PEACH_TEST_HOST_VERBOSE", 0, 0, 2);
    only = getenv("PEACH_TEST_HOST_ONLY");
    if (only != NULL && strcmp(only, "legacy") != 0 &&
-         strcmp(only, "pipeline") != 0) only = NULL;
+         strcmp(only, "pipeline") != 0 && strcmp(only, "profiles") != 0) only = NULL;
    Ncache = (int) env_long("PEACH_TEST_HOST_CACHE", MAXCACHE, 0, MAXCACHE);
    Streams = getenv("PEACH_TEST_HOST_STREAMS");
    if (Streams != NULL && *Streams == '\0') Streams = NULL;
@@ -2422,7 +2529,8 @@ int main(void)
 
    memset(&R, 0, sizeof(R));
    R.thread = DEVICE_THREAD;
-   scenario_checkhash();
+   scenario_profiles();
+   if (only == NULL || strcmp(only, "profiles") != 0) scenario_checkhash();
    if (only == NULL || strcmp(only, "legacy") == 0) scenarios_legacy();
    if (R.dev.peach) dev_free();
    if (only == NULL || strcmp(only, "pipeline") == 0) scenarios_pipeline();
