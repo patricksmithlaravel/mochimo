@@ -76,7 +76,7 @@ To uninstall a Mochimo Node installed as a service, find your mochimo repositori
 *GPU Miner ONLY supports SOLO mining with NVIDIA cards*<br/>
 Building GPU Miner from source requires an appropriate [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) installation compatible with your target GPUs.
 ```sh
-git clone https://github.com/mochimodev/mochimo.git
+git clone --recurse-submodules https://github.com/patricksmithlaravel/mochimo.git
 make -C mochimo/ miner
 # mochimo/bin/gpuminer --help
 ```
@@ -85,6 +85,20 @@ make -C mochimo/ miner
 make -C mochimo/ miner NVCCARGS=-arch=sm_61 # 10-series cards
 # mochimo/bin/gpuminer --help
 ```
+
+## Automatic RTX 3090, 4090 and 5090 profiles
+
+The miner selects the pipeline profile per device at initialization. The desktop RTX 3090 (compute capability 8.6) uses 48 slots per resident thread; the desktop RTX 4090 (8.9) and compute capability 12.x devices, including the RTX 5090, retain their 64-slot profiles. These profiles target masks `0x78,0x40,0x40,0x40,0,0,0,0` and three batch contexts; free device memory can reduce the batch size or context count. Valid `MCM_PEACH_*` overrides remain available.
+
+For one binary with native code for all three GPUs, use CUDA 12.8 or newer and a fresh build of this fork:
+
+```sh
+git clone --recurse-submodules https://github.com/patricksmithlaravel/mochimo.git mochimo-optimized
+# Before this change is merged, add --branch feature/peach-3090-profile to git clone.
+make -C mochimo-optimized miner NVCCARGS="-gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_120,code=sm_120"
+```
+
+CUDA selects the matching native device code, while the miner selects its masks and batch sizing. Build in a fresh checkout when changing architecture flags: Make does not track flag changes as dependencies. The project's default build targets are unchanged. Older binaries need rebuilding to include the RTX 3090 selection.
 
 ## Run GPU Miner
 
