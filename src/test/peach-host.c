@@ -80,7 +80,7 @@
  * Environment: PEACH_TEST_HOST_PROCS (worker processes, default 4),
  * PEACH_TEST_HOST_CACHE (cached maps, 0..2, default 2; 1 GiB each),
  * PEACH_TEST_HOST_VERBOSE=1 (log of the code under test, launches),
- * PEACH_TEST_HOST_ONLY=legacy|pipeline (only these scenarios),
+ * PEACH_TEST_HOST_ONLY=legacy|pipeline|profiles (only these scenarios),
  * PEACH_TEST_HOST_STREAMS=<n> (MCM_PEACH_STREAMS of every scenario but
  * the checks of (7) that set it themselves; default unset: automatic).
  * @copyright Adequate Systems LLC, 2018-2025. All Rights Reserved.
@@ -1906,42 +1906,78 @@ static void scenario_profiles(void)
       const char *name, *model;
       int major, minor;
       const char *skip, *batch, *streams, *fault;
-      int masks; /* 0: generic, 1: selected late MD2, 2: full evaluation */
+      int masks; /* 0: generic, 1: selected, 2: full, 3: late MD2 only */
       word32 slots_per_thread;
-      int contexts, properties_queries;
+      int contexts, properties_queries, auto_rtx3090;
    } profiles[] = {
       { "4090 automatic", "NVIDIA GeForce RTX 4090", 8, 9,
-         NULL, NULL, NULL, NULL, 1, 64, 3, 1 },
+         NULL, NULL, NULL, NULL, 1, 64, 3, 1, 0 },
       { "5090 automatic", "NVIDIA GeForce RTX 5090", 12, 0,
-         NULL, NULL, NULL, NULL, 1, 64, 3, 0 },
+         NULL, NULL, NULL, NULL, 1, 64, 3, 0, 0 },
       { "other cc12", "Other cc12 device", 12, 1,
-         NULL, NULL, NULL, NULL, 1, 64, 3, 0 },
+         NULL, NULL, NULL, NULL, 1, 64, 3, 0, 0 },
       { "other Ada", "NVIDIA GeForce RTX 4080", 8, 9,
-         NULL, NULL, NULL, NULL, 0, 32, 3, 1 },
+         NULL, NULL, NULL, NULL, 0, 32, 3, 1, 0 },
       { "4090 D", "NVIDIA GeForce RTX 4090 D", 8, 9,
-         NULL, NULL, NULL, NULL, 0, 32, 3, 1 },
+         NULL, NULL, NULL, NULL, 0, 32, 3, 1, 0 },
       { "4090 Laptop", "NVIDIA GeForce RTX 4090 Laptop GPU", 8, 9,
-         NULL, NULL, NULL, NULL, 0, 32, 3, 1 },
+         NULL, NULL, NULL, NULL, 0, 32, 3, 1, 0 },
       { "4090 wrong capability", "NVIDIA GeForce RTX 4090", 8, 6,
-         NULL, NULL, NULL, NULL, 0, 32, 3, 1 },
+         NULL, NULL, NULL, NULL, 0, 32, 3, 1, 0 },
       { "properties query failure", "NVIDIA GeForce RTX 4090", 8, 9,
-         NULL, NULL, NULL, "cudaGetDeviceProperties", 0, 32, 3, 1 },
+         NULL, NULL, NULL, "cudaGetDeviceProperties", 0, 32, 3, 1, 0 },
       { "major query failure", "NVIDIA GeForce RTX 4090", 8, 9,
-         NULL, NULL, NULL, "cudaDeviceGetAttribute", 0, 32, 3, 0 },
+         NULL, NULL, NULL, "cudaDeviceGetAttribute", 0, 32, 3, 0, 0 },
       { "4090 after failed query", "NVIDIA GeForce RTX 4090", 8, 9,
-         NULL, NULL, NULL, NULL, 1, 64, 3, 1 },
+         NULL, NULL, NULL, NULL, 1, 64, 3, 1, 0 },
       { "manual MD2 skip", "NVIDIA GeForce RTX 4090", 8, 9,
-         "0x40", NULL, NULL, NULL, 0, 32, 3, 0 },
+         "0x40", NULL, NULL, NULL, 0, 32, 3, 0, 0 },
       { "manual full evaluation", "NVIDIA GeForce RTX 4090", 8, 9,
-         "0", NULL, NULL, NULL, 2, 32, 3, 0 },
+         "0", NULL, NULL, NULL, 2, 32, 3, 0, 0 },
       { "manual selected masks", "NVIDIA GeForce RTX 4090", 8, 9,
-         "0x78,0x40,0x40,0x40,0,0,0,0", NULL, NULL, NULL, 1, 64, 3, 0 },
+         "0x78,0x40,0x40,0x40,0,0,0,0", NULL, NULL, NULL, 1, 64, 3, 0, 0 },
       { "explicit batch and streams", "NVIDIA GeForce RTX 4090", 8, 9,
-         NULL, "6291456", "2", NULL, 1, 32, 2, 1 },
+         NULL, "6291456", "2", NULL, 1, 32, 2, 1, 0 },
       { "zero requests automatic", "NVIDIA GeForce RTX 4090", 8, 9,
-         NULL, "0", "0", NULL, 1, 64, 3, 1 },
+         NULL, "0", "0", NULL, 1, 64, 3, 1, 0 },
       { "invalid requests automatic", "NVIDIA GeForce RTX 4090", 8, 9,
-         "invalid", "invalid", "invalid", NULL, 1, 64, 3, 1 }
+         "invalid", "invalid", "invalid", NULL, 1, 64, 3, 1, 0 },
+      { "3090 automatic round-zero mask", "NVIDIA GeForce RTX 3090", 8, 6,
+         NULL, NULL, NULL, NULL, 1, 48, 3, 1, 1 },
+      { "3090 zero requests automatic", "NVIDIA GeForce RTX 3090", 8, 6,
+         NULL, "0", "0", NULL, 1, 48, 3, 1, 1 },
+      { "3090 invalid requests automatic", "NVIDIA GeForce RTX 3090", 8, 6,
+         "invalid", "invalid", "invalid", NULL, 1, 48, 3, 1, 1 },
+      { "3090 explicit batch", "NVIDIA GeForce RTX 3090", 8, 6,
+         NULL, "6291456", NULL, NULL, 1, 32, 3, 1, 1 },
+      { "3090 one context", "NVIDIA GeForce RTX 3090", 8, 6,
+         NULL, NULL, "1", NULL, 1, 48, 1, 1, 1 },
+      { "3090 two contexts", "NVIDIA GeForce RTX 3090", 8, 6,
+         NULL, NULL, "2", NULL, 1, 48, 2, 1, 1 },
+      { "3090 three contexts", "NVIDIA GeForce RTX 3090", 8, 6,
+         NULL, NULL, "3", NULL, 1, 48, 3, 1, 1 },
+      { "3090 four contexts", "NVIDIA GeForce RTX 3090", 8, 6,
+         NULL, NULL, "4", NULL, 1, 48, 4, 1, 1 },
+      { "3090 wrong capability", "NVIDIA GeForce RTX 3090", 8, 9,
+         NULL, NULL, NULL, NULL, 0, 32, 3, 1, 0 },
+      { "3090 Ti generic", "NVIDIA GeForce RTX 3090 Ti", 8, 6,
+         NULL, NULL, NULL, NULL, 0, 32, 3, 1, 0 },
+      { "other Ampere generic", "NVIDIA GeForce RTX 3080", 8, 6,
+         NULL, NULL, NULL, NULL, 0, 32, 3, 1, 0 },
+      { "3090 properties failure", "NVIDIA GeForce RTX 3090", 8, 6,
+         NULL, NULL, NULL, "cudaGetDeviceProperties", 0, 32, 3, 1, 0 },
+      { "3090 major failure", "NVIDIA GeForce RTX 3090", 8, 6,
+         NULL, NULL, NULL, "cudaDeviceGetAttribute", 0, 32, 3, 0, 0 },
+      { "3090 recovery after query failure", "NVIDIA GeForce RTX 3090", 8, 6,
+         NULL, NULL, NULL, NULL, 1, 48, 3, 1, 1 },
+      { "3090 manual MD2 skip", "NVIDIA GeForce RTX 3090", 8, 6,
+         "0x40", NULL, NULL, NULL, 0, 32, 3, 0, 0 },
+      { "3090 manual full evaluation", "NVIDIA GeForce RTX 3090", 8, 6,
+         "0", NULL, NULL, NULL, 2, 32, 3, 0, 0 },
+      { "3090 manual late MD2", "NVIDIA GeForce RTX 3090", 8, 6,
+         "0x40,0x40,0x40,0x40,0,0,0,0", NULL, NULL, NULL, 3, 32, 3, 0, 0 },
+      { "3090 manual round-zero mask", "NVIDIA GeForce RTX 3090", 8, 6,
+         "0x78,0x40,0x40,0x40,0,0,0,0", NULL, NULL, NULL, 1, 64, 3, 0, 0 }
    };
    const EMU_RT_DEVICE saved = emu_rt.dev;
    const int thread = emu_rt.thread;
@@ -1979,11 +2015,18 @@ static void scenario_profiles(void)
       CHECK(emu_rt_fault_clear() == (profiles[i].fault ? 1UL : 0UL),
          "%s: query fault coverage", profiles[i].name);
       CHECK(cudaGetLastError() == cudaSuccess, "%s: query error not cleared", profiles[i].name);
+      CHECK(profile.auto_rtx3090 == profiles[i].auto_rtx3090,
+         "%s: cached automatic 3090 profile %d", profiles[i].name, profile.auto_rtx3090);
       for (j = 0; j < 8; j++) {
          const word8 expected = profiles[i].masks == 1 ?
-            (j == 0 ? 0x78 : j < 4 ? 0x40 : 0) : profiles[i].masks == 2 ? 0 : 0x40;
+            (j == 0 ? 0x78 : j < 4 ? 0x40 : 0) : profiles[i].masks == 3 ?
+            (j < 4 ? 0x40 : 0) : profiles[i].masks == 2 ? 0 : 0x40;
          CHECK(profile.cfg_skip[j] == expected, "%s: mask[%d] = 0x%x",
             profiles[i].name, j, (unsigned) profile.cfg_skip[j]);
+      }
+      if (profile.auto_rtx3090) {
+         CHECK(profile.cfg_skip[0] == 0x78 && peach_cuda_half0(profile.cfg_skip[0]),
+            "%s: round-zero mask or automatic half sizing missing", profiles[i].name);
       }
       CHECK(peach_cuda_sizing(&device, &profile, 0) == VEOK, "%s: sizing", profiles[i].name);
       want = profiles[i].slots_per_thread * (word32) emu_rt.dev.sms * 1536;
@@ -1997,6 +2040,17 @@ static void scenario_profiles(void)
             profile.nctx == PEACH_CUDA_NCTX_MIN && profile.cap < want &&
             profile.cap % PEACH_PIPE_BLOCK == 0 && profile.nslots <= profile.cap,
             "4090 automatic memory clamping and context fallback");
+      }
+      if (strcmp(profiles[i].name, "3090 automatic round-zero mask") == 0) {
+         CHECK(profile.nslots == 9437184, "3090 automatic slot count");
+         emu_rt.dev.total_mem = (size_t) 3 << 30;
+         CHECK(peach_cuda_sizing(&device, &profile, (size_t) 2 << 30) == VEOK &&
+            profile.nctx == PEACH_CUDA_NCTX_MIN && profile.cap < want &&
+            profile.cap % PEACH_PIPE_BLOCK == 0 && profile.nslots <= profile.cap,
+            "3090 memory reserve clamping and context fallback");
+         CHECK(peach_cuda_sizing(&device, &profile, (size_t) 4 << 30) == VERROR,
+            "3090 exhausted reserve should reject sizing");
+         CHECK(cudaGetLastError() == cudaSuccess, "3090 reserve error cleared");
       }
       printf("   %s: masks and sizing verified\n", profiles[i].name);
    }
