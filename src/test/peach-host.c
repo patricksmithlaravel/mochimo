@@ -1942,8 +1942,8 @@ static void scenario_profiles(void)
          NULL, "0", "0", NULL, 1, 64, 3, 1, 0 },
       { "invalid requests automatic", "NVIDIA GeForce RTX 4090", 8, 9,
          "invalid", "invalid", "invalid", NULL, 1, 64, 3, 1, 0 },
-      { "3090 automatic late MD2", "NVIDIA GeForce RTX 3090", 8, 6,
-         NULL, NULL, NULL, NULL, 3, 32, 3, 1, 1 },
+      { "3090 automatic round-zero mask", "NVIDIA GeForce RTX 3090", 8, 6,
+         NULL, NULL, NULL, NULL, 1, 64, 3, 1, 1 },
       { "3090 wrong capability", "NVIDIA GeForce RTX 3090", 8, 9,
          NULL, NULL, NULL, NULL, 0, 32, 3, 1, 0 },
       { "3090 Ti generic", "NVIDIA GeForce RTX 3090 Ti", 8, 6,
@@ -1955,13 +1955,15 @@ static void scenario_profiles(void)
       { "3090 major failure", "NVIDIA GeForce RTX 3090", 8, 6,
          NULL, NULL, NULL, "cudaDeviceGetAttribute", 0, 32, 3, 0, 0 },
       { "3090 recovery after query failure", "NVIDIA GeForce RTX 3090", 8, 6,
-         NULL, NULL, NULL, NULL, 3, 32, 3, 1, 1 },
+         NULL, NULL, NULL, NULL, 1, 64, 3, 1, 1 },
       { "3090 manual MD2 skip", "NVIDIA GeForce RTX 3090", 8, 6,
          "0x40", NULL, NULL, NULL, 0, 32, 3, 0, 0 },
       { "3090 manual full evaluation", "NVIDIA GeForce RTX 3090", 8, 6,
          "0", NULL, NULL, NULL, 2, 32, 3, 0, 0 },
       { "3090 manual late MD2", "NVIDIA GeForce RTX 3090", 8, 6,
-         "0x40,0x40,0x40,0x40,0,0,0,0", NULL, NULL, NULL, 3, 32, 3, 0, 0 }
+         "0x40,0x40,0x40,0x40,0,0,0,0", NULL, NULL, NULL, 3, 32, 3, 0, 0 },
+      { "3090 manual round-zero mask", "NVIDIA GeForce RTX 3090", 8, 6,
+         "0x78,0x40,0x40,0x40,0,0,0,0", NULL, NULL, NULL, 1, 64, 3, 0, 0 }
    };
    const EMU_RT_DEVICE saved = emu_rt.dev;
    const int thread = emu_rt.thread;
@@ -2009,8 +2011,8 @@ static void scenario_profiles(void)
             profiles[i].name, j, (unsigned) profile.cfg_skip[j]);
       }
       if (profile.auto_rtx3090) {
-         CHECK(profile.cfg_skip[0] == 0x40 && !peach_cuda_half0(profile.cfg_skip[0]),
-            "%s: round 0 or automatic half sizing changed", profiles[i].name);
+         CHECK(profile.cfg_skip[0] == 0x78 && peach_cuda_half0(profile.cfg_skip[0]),
+            "%s: round-zero mask or automatic half sizing missing", profiles[i].name);
       }
       CHECK(peach_cuda_sizing(&device, &profile, 0) == VEOK, "%s: sizing", profiles[i].name);
       want = profiles[i].slots_per_thread * (word32) emu_rt.dev.sms * 1536;

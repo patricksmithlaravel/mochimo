@@ -1306,6 +1306,7 @@ static int peach_cuda_skip_default(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
          P->cfg_skip[i] = i < PEACH_CUDA_SKIP_LATE_ROUND ?
             PEACH_PIPE_SKIP_MD2 : 0;
       }
+      P->cfg_skip[0] = PEACH_CUDA_SKIP_LATE_R0;
    }
 
    return major;
