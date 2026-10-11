@@ -63,6 +63,8 @@
    twice that when the round 0 skip mask drops about half of the nonces
    (see peach_cuda_half0()). Large batches fill the tile ordered queues
    densely, so that jumps to neighbouring tiles share cache lines */
+#define PEACH_CUDA_SLOTS_RTX3090    24 /**< automatic desktop RTX 3090 base
+   slots per resident thread, doubled to 48 by its round 0 skip mask */
 #define PEACH_CUDA_MD2_BLOCKS       4  /**< max. resident blocks per SM of
    the MD2 hash kernel with several batch contexts (fewer than its
    occupancy allows, see peach_cuda_pipeline_setup()) */
@@ -1238,13 +1240,13 @@ static void peach_cuda_config(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P)
  * @private
  * Default (automatic) skip masks of the pipeline solver for the current
  * CUDA device, used when MCM_PEACH_SKIP is unset (or invalid): on
- * the desktop RTX 4090 (cc 8.9), or devices of compute capability
- * PEACH_CUDA_SKIP_LATE_CC.x, MD2 jumps are
+ * the desktop RTX 4090 (cc 8.9), RTX 3090 (cc 8.6), or devices of
+ * compute capability PEACH_CUDA_SKIP_LATE_CC.x, MD2 jumps are
  * dropped in rounds 0..PEACH_CUDA_SKIP_LATE_ROUND - 1 and evaluated in
  * the later rounds, and round 0 also drops SHA-256, SHA3 and Keccak
  * jumps (masks PEACH_CUDA_SKIP_LATE_R0, 0x40 x 3, then 0x00 x 4); on
- * the desktop RTX 3090 (cc 8.6), only late MD2 retention is selected:
- * masks 0x40 x 4, then 0x00 x 4, without changing round 0 or sizing.
+ * the desktop RTX 3090, automatic sizing uses 48 slots per resident
+ * thread including the round 0 doubling (see peach_cuda_sizing()).
  * Every other device uses masks 0x40 in all eight rounds.
  * <br />
  * An MD2 jump costs several other jumps, and dropping a nonce loses the
@@ -1341,8 +1343,10 @@ static int peach_cuda_half0(word8 mask0)
 /**
  * @private
  * Size the pipeline batch contexts of the current CUDA device. Slots per
- * batch N = PEACH_CUDA_SLOTS_PER_THREAD x SMs x maxThreadsPerSM, twice
- * that when the round 0 skip mask drops about half of the nonces
+ * batch N = base slots x SMs x maxThreadsPerSM, where the base is
+ * PEACH_CUDA_SLOTS_RTX3090 for the automatic desktop RTX 3090 profile
+ * and PEACH_CUDA_SLOTS_PER_THREAD otherwise. The base doubles when the
+ * round 0 skip mask drops about half of the nonces
  * (peach_cuda_half0(): the queues of rounds 1..7 stay as dense), or
  * MCM_PEACH_BATCH when set, clamped to [128 x SMs, memory limit] and
  * rounded to whole blocks of 128 slots; the memory limit wins when both
@@ -1399,7 +1403,8 @@ static int peach_cuda_sizing(DEVICE_CTX *ctx, PEACH_CUDA_CTX *P,
    lo = (word32) P->sms * PEACH_PIPE_BLOCK;
    avail = mfree > reserve ? mfree - reserve : 0;
    want = P->cfg_batch ? (word64) P->cfg_batch : (word64) P->sms *
-      (word64) P->max_threads_sm * PEACH_CUDA_SLOTS_PER_THREAD *
+      (word64) P->max_threads_sm * (P->auto_rtx3090 ?
+      PEACH_CUDA_SLOTS_RTX3090 : PEACH_CUDA_SLOTS_PER_THREAD) *
       (peach_cuda_half0(P->cfg_skip[0]) ? 2 : 1);
    for (nctx = P->cfg_nctx ? P->cfg_nctx : PEACH_CUDA_NCTX_AUTO; ; nctx--) {
       n = want < lo ? lo : want;
